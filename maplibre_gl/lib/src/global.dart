@@ -130,8 +130,8 @@ Future<void> bindMapLibreTileCache({
 Future<void> cancelMapLibreTileFetches() async {
   try {
     await _tileCacheChannel.invokeMethod<void>('cancelPendingFetches');
-  } on MissingPluginException {
-    // Plugin not attached yet (tests / early bootstrap).
+  } catch (_) {
+    // Plugin not attached / binding not ready (tests, early bootstrap).
   }
 }
 
