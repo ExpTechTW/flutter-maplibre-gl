@@ -125,6 +125,16 @@ Future<void> bindMapLibreTileCache({
   });
 }
 
+/// Cancels in-flight native tile HTTP (URLSession / OkHttp) for abandoned
+/// radar/satellite frames after a scrub. Best-effort; safe anytime.
+Future<void> cancelMapLibreTileFetches() async {
+  try {
+    await _tileCacheChannel.invokeMethod<void>('cancelPendingFetches');
+  } on MissingPluginException {
+    // Plugin not attached yet (tests / early bootstrap).
+  }
+}
+
 Future<List<OfflineRegion>> mergeOfflineRegions(String path) async {
   final String regionsJson = await _globalChannel.invokeMethod(
     'mergeOfflineRegions',

@@ -13,6 +13,15 @@ enum MapLibreDartTileBridge {
             name: "plugins.flutter.io/maplibre_gl/tile_cache",
             binaryMessenger: messenger
         )
+        ch.setMethodCallHandler { call, result in
+            switch call.method {
+            case "cancelPendingFetches":
+                MapLibreHeadersProtocol.cancelAllForwardTasks()
+                result(nil)
+            default:
+                result(FlutterMethodNotImplemented)
+            }
+        }
         lock.lock()
         channel = ch
         lock.unlock()

@@ -25,6 +25,15 @@ final class MapLibreHeadersProtocol: URLProtocol {
         return URLSession(configuration: config)
     }()
 
+    /// Drop every in-flight forward (abandoned radar/sat frames after scrub).
+    static func cancelAllForwardTasks() {
+        forwardSession.getAllTasks { tasks in
+            for task in tasks {
+                task.cancel()
+            }
+        }
+    }
+
     private var activeTask: URLSessionDataTask?
     private var stopped = false
     private var forwardingTile = false

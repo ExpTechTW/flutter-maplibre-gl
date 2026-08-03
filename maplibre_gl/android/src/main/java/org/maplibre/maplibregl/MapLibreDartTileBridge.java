@@ -38,6 +38,15 @@ final class MapLibreDartTileBridge {
   static void attach(BinaryMessenger messenger) {
     MethodChannel ch =
         new MethodChannel(messenger, "plugins.flutter.io/maplibre_gl/tile_cache");
+    ch.setMethodCallHandler(
+        (call, result) -> {
+          if ("cancelPendingFetches".equals(call.method)) {
+            MapLibreHttpRequestUtil.cancelPendingFetches();
+            result.success(null);
+          } else {
+            result.notImplemented();
+          }
+        });
     synchronized (lock) {
       channel = ch;
     }

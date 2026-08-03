@@ -23,6 +23,7 @@ abstract class MapLibreHttpRequestUtil {
   private static Integer currentMaxRequests;
   private static Integer currentMaxRequestsPerHost;
   private static final int MAX_PUT_BYTES = 2 * 1024 * 1024;
+  private static volatile OkHttpClient client;
 
   public static void install() {
     try {
@@ -30,6 +31,13 @@ abstract class MapLibreHttpRequestUtil {
     } catch (RuntimeException ignored) {
       // Best-effort at plugin attach.
     }
+  }
+
+  /** Drop every in-flight / queued OkHttp call (abandoned radar/sat frames). */
+  public static void cancelPendingFetches() {
+    OkHttpClient c = client;
+    if (c == null) return;
+    c.dispatcher().cancelAll();
   }
 
   public static void setHttpHeaders(Map<String, String> headers, MethodChannel.Result result) {
@@ -104,7 +112,9 @@ abstract class MapLibreHttpRequestUtil {
     builder.addInterceptor(MapLibreHttpRequestUtil::serveFromDart);
     builder.addNetworkInterceptor(MapLibreHttpRequestUtil::applyHeadersAndPut);
 
-    HttpRequestUtil.setOkHttpClient(builder.build());
+    OkHttpClient built = builder.build();
+    client = built;
+    HttpRequestUtil.setOkHttpClient(built);
   }
 
   /** ExpTech tile hit from Dart; miss falls through to a single native fetch. */
