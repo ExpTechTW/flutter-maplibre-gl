@@ -53,6 +53,11 @@ abstract class MapLibreHttpRequestUtil {
     }
   }
 
+  /** Headers last passed to [setCustomHeaders] / [setHttpHeaders] (empty if none). */
+  public static Map<String, String> getCustomHeaders() {
+    return currentHeaders != null ? currentHeaders : java.util.Collections.emptyMap();
+  }
+
   public static void setMaxConcurrentRequests(
       Integer maxRequests, Integer maxRequestsPerHost, MethodChannel.Result result) {
     if (maxRequests != null && maxRequests < 1) {

@@ -13,4 +13,8 @@ public class MapLibreCustomHttpInterceptor {
       Map<String, String> headers, List<String> filter, MethodChannel.Result result) {
     MapLibreHttpRequestUtil.setCustomHeaders(headers, filter, result);
   }
+
+  public static Map<String, String> getCustomHeaders() {
+    return MapLibreHttpRequestUtil.getCustomHeaders();
+  }
 }

@@ -1247,7 +1247,7 @@ final class MapLibreMapController
       case "map#getCustomHeaders":
         {
           if (mapLibreMap != null) {
-            result.success(MapLibreCustomHttpInterceptor.CustomHeaders);
+            result.success(MapLibreCustomHttpInterceptor.getCustomHeaders());
           } else {
             result.success(null);
           }
