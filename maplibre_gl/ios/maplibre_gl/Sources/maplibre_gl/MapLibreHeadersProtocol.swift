@@ -26,12 +26,16 @@ final class MapLibreHeadersProtocol: URLProtocol {
     }()
 
     /// Drop every in-flight forward (abandoned radar/sat frames after scrub).
+    /// Blocks until the cancel list is applied so the next fetch cannot race.
     static func cancelAllForwardTasks() {
+        let sem = DispatchSemaphore(value: 0)
         forwardSession.getAllTasks { tasks in
             for task in tasks {
                 task.cancel()
             }
+            sem.signal()
         }
+        _ = sem.wait(timeout: .now() + 0.5)
     }
 
     private var activeTask: URLSessionDataTask?
