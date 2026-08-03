@@ -2,6 +2,7 @@ package org.maplibre.maplibregl;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.util.LruCache;
 import androidx.annotation.Nullable;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodChannel;
@@ -14,6 +15,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Thin bridge: Dart owns SQLite + metering. Native asks {@code get} before
  * fetch and {@code put} after a tile miss download.
+ *
+ * <p>A process-local {@link LruCache} sits in front of the MethodChannel so a
+ * radar settle does not serialize every hit through Flutter's main isolate.
  */
 final class MapLibreDartTileBridge {
   static final class Entry {
@@ -32,6 +36,13 @@ final class MapLibreDartTileBridge {
   private static MethodChannel channel;
   private static final Handler main = new Handler(Looper.getMainLooper());
   private static final long GET_TIMEOUT_MS = 100;
+  private static final LruCache<String, Entry> mem =
+      new LruCache<String, Entry>(32 * 1024 * 1024) {
+        @Override
+        protected int sizeOf(String key, Entry value) {
+          return value.data.length;
+        }
+      };
 
   private MapLibreDartTileBridge() {}
 
@@ -62,6 +73,9 @@ final class MapLibreDartTileBridge {
   @Nullable
   static Entry get(String url) {
     if (!isTileUrl(url)) return null;
+    Entry cached = mem.get(url);
+    if (cached != null) return cached;
+
     final MethodChannel ch;
     synchronized (lock) {
       ch = channel;
@@ -83,11 +97,13 @@ final class MapLibreDartTileBridge {
                       Map<String, Object> m = (Map<String, Object>) result;
                       Object data = m.get("data");
                       if (data instanceof byte[]) {
-                        out.set(
+                        Entry entry =
                             new Entry(
                                 (byte[]) data,
                                 (String) m.get("contentType"),
-                                (String) m.get("etag")));
+                                (String) m.get("etag"));
+                        mem.put(url, entry);
+                        out.set(entry);
                       }
                     }
                     latch.countDown();
@@ -114,6 +130,7 @@ final class MapLibreDartTileBridge {
   static void putAsync(
       String url, byte[] data, @Nullable String contentType, @Nullable String etag) {
     if (!isTileUrl(url) || data == null) return;
+    mem.put(url, new Entry(data, contentType, etag));
     final MethodChannel ch;
     synchronized (lock) {
       ch = channel;

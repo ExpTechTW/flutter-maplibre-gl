@@ -21,7 +21,7 @@ final class MapLibreHeadersProtocol: URLProtocol {
         // Scrub storms: fail fast instead of holding 30s slots for abandoned frames.
         config.timeoutIntervalForRequest = 8
         config.timeoutIntervalForResource = 12
-        config.httpMaximumConnectionsPerHost = 8
+        config.httpMaximumConnectionsPerHost = 16
         return URLSession(configuration: config)
     }()
 

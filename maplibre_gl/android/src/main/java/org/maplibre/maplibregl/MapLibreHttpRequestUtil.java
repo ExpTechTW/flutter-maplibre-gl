@@ -103,9 +103,9 @@ abstract class MapLibreHttpRequestUtil {
             .callTimeout(12, TimeUnit.SECONDS);
 
     Dispatcher dispatcher = new Dispatcher();
-    dispatcher.setMaxRequests(currentMaxRequests != null ? currentMaxRequests : 32);
+    dispatcher.setMaxRequests(currentMaxRequests != null ? currentMaxRequests : 64);
     dispatcher.setMaxRequestsPerHost(
-        currentMaxRequestsPerHost != null ? currentMaxRequestsPerHost : 8);
+        currentMaxRequestsPerHost != null ? currentMaxRequestsPerHost : 16);
     builder.dispatcher(dispatcher);
 
     // App interceptor: Dart hit short-circuits. Network interceptor: headers + put.
