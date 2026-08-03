@@ -12,8 +12,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Thin bridge: ask Dart for an ExpTech tile body. No native cache / put — Dart
- * Dio + SQLite own the network and persist path.
+ * Thin bridge: Dart owns SQLite + metering. Native asks {@code get} before
+ * fetch and {@code put} after a tile miss download.
  */
 final class MapLibreDartTileBridge {
   static final class Entry {
@@ -31,7 +31,6 @@ final class MapLibreDartTileBridge {
   private static final Object lock = new Object();
   private static MethodChannel channel;
   private static final Handler main = new Handler(Looper.getMainLooper());
-  /** SQLite-backed get can be slower than the old Dart LRU. */
   private static final long GET_TIMEOUT_MS = 500;
 
   private MapLibreDartTileBridge() {}
@@ -44,14 +43,13 @@ final class MapLibreDartTileBridge {
     }
   }
 
-  /** ExpTech immutable tiles only — not glyphs / other `*.pbf`. */
+  /** ExpTech immutable tiles only — not glyphs / other {@code *.pbf}. */
   static boolean isTileUrl(String url) {
     if (url == null) return false;
     if (url.contains("/api/v1/map/tiles/")) return true;
     return url.contains("/api/v2/tiles/");
   }
 
-  /** Synchronous lookup — call from an OkHttp interceptor thread, not main. */
   @Nullable
   static Entry get(String url) {
     if (!isTileUrl(url)) return null;
@@ -102,6 +100,22 @@ final class MapLibreDartTileBridge {
       Thread.currentThread().interrupt();
     }
     return out.get();
+  }
+
+  static void putAsync(
+      String url, byte[] data, @Nullable String contentType, @Nullable String etag) {
+    if (!isTileUrl(url) || data == null) return;
+    final MethodChannel ch;
+    synchronized (lock) {
+      ch = channel;
+    }
+    if (ch == null) return;
+    Map<String, Object> args = new HashMap<>();
+    args.put("url", url);
+    args.put("data", data);
+    if (contentType != null) args.put("contentType", contentType);
+    if (etag != null) args.put("etag", etag);
+    main.post(() -> ch.invokeMethod("put", args));
   }
 
   private static Map<String, Object> mapOf(String k, Object v) {

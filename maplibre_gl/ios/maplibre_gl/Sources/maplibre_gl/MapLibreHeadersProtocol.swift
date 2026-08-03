@@ -1,14 +1,16 @@
 import Foundation
 
 // URLProtocol that:
-// 1. Serves ExpTech tiles only from Dart (Dio + SQLite) — never native-fetch
-// 2. Injects custom headers on all other live requests (style / glyphs / …)
+// 1. Serves ExpTech tiles from Dart SQLite when present
+// 2. On miss, fetches once via a shared URLSession and puts the body into Dart
+// 3. Injects custom headers on all live requests (tiles / style / glyphs / …)
 //
 // Forwarding uses ONE shared ephemeral URLSession with `protocolClasses = []`
-// (no recursion, no per-request session). Creating + invalidate'ing a session
-// per tile previously UAF'd on `com.apple.network.connections` / objc_retain.
+// (no recursion, no per-request session). AmbientPrefetch is off — MapLibre is
+// the sole tile network path, so there is no Dio+native double fetch.
 final class MapLibreHeadersProtocol: URLProtocol {
     private static let handledKey = "MapLibreHeadersProtocolHandled"
+    private static let maxPutBytes = 2 * 1024 * 1024
 
     /// Shared forwarder — never invalidate; cancel tasks only.
     private static let forwardSession: URLSession = {
@@ -22,6 +24,7 @@ final class MapLibreHeadersProtocol: URLProtocol {
 
     private var activeTask: URLSessionDataTask?
     private var stopped = false
+    private var forwardingTile = false
 
     override class func canInit(with request: URLRequest) -> Bool {
         guard URLProtocol.property(forKey: handledKey, in: request) == nil else {
@@ -38,38 +41,31 @@ final class MapLibreHeadersProtocol: URLProtocol {
     override func startLoading() {
         let urlString = request.url?.absoluteString ?? ""
 
-        // ExpTech tiles: Dart Dio is the only network path. Miss → 404 (empty),
-        // MapLibre will retry after AmbientPrefetch lands the row.
-        if MapLibreDartTileBridge.isTileUrl(urlString), let url = request.url {
-            if let hit = MapLibreDartTileBridge.get(url: urlString) {
-                var headers: [String: String] = [
-                    "Content-Type": hit.contentType ?? "application/octet-stream",
-                    "Content-Length": "\(hit.data.count)",
-                ]
-                if let etag = hit.etag {
-                    headers["ETag"] = etag
-                }
-                let response = HTTPURLResponse(
-                    url: url,
-                    statusCode: 200,
-                    httpVersion: "HTTP/1.1",
-                    headerFields: headers
-                )!
-                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                client?.urlProtocol(self, didLoad: hit.data)
-                client?.urlProtocolDidFinishLoading(self)
-                return
+        // ExpTech tile hit → Dart only (no network).
+        if MapLibreDartTileBridge.isTileUrl(urlString),
+           let hit = MapLibreDartTileBridge.get(url: urlString),
+           let url = request.url
+        {
+            var headers: [String: String] = [
+                "Content-Type": hit.contentType ?? "application/octet-stream",
+                "Content-Length": "\(hit.data.count)",
+            ]
+            if let etag = hit.etag {
+                headers["ETag"] = etag
             }
             let response = HTTPURLResponse(
                 url: url,
-                statusCode: 404,
+                statusCode: 200,
                 httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Length": "0"]
+                headerFields: headers
             )!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: hit.data)
             client?.urlProtocolDidFinishLoading(self)
             return
         }
+
+        forwardingTile = MapLibreDartTileBridge.isTileUrl(urlString)
 
         let mutable = (request as NSURLRequest).mutableCopy() as! NSMutableURLRequest
         URLProtocol.setProperty(true, forKey: Self.handledKey, in: mutable)
@@ -120,6 +116,22 @@ final class MapLibreHeadersProtocol: URLProtocol {
         if !body.isEmpty {
             client?.urlProtocol(self, didLoad: body)
         }
+
+        if forwardingTile,
+           let http = response as? HTTPURLResponse,
+           (http.statusCode == 200 || http.statusCode == 404),
+           body.count <= Self.maxPutBytes,
+           let url = http.url?.absoluteString ?? request.url?.absoluteString
+        {
+            // 200 body or basemap-style 404 hole — both land in Dart SQLite.
+            MapLibreDartTileBridge.putAsync(
+                url: url,
+                data: body,
+                contentType: http.value(forHTTPHeaderField: "Content-Type"),
+                etag: http.value(forHTTPHeaderField: "ETag")
+            )
+        }
+
         client?.urlProtocolDidFinishLoading(self)
     }
 }

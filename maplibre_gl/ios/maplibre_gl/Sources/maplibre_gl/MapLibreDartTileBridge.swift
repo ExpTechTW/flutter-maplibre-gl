@@ -1,12 +1,11 @@
 import Flutter
 import Foundation
 
-/// Thin bridge: ask Dart for an ExpTech tile body. No native cache / put —
-/// Dart Dio + SQLite own the network and persist path.
+/// Thin bridge: Dart owns SQLite + metering. Native asks `get` before fetch and
+/// `put` after a tile miss download.
 enum MapLibreDartTileBridge {
     private static let lock = NSLock()
     private static var channel: FlutterMethodChannel?
-    /// SQLite-backed get can be slower than the old Dart LRU — give it room.
     private static let getTimeout: TimeInterval = 0.5
 
     static func attach(messenger: FlutterBinaryMessenger) {
@@ -19,8 +18,7 @@ enum MapLibreDartTileBridge {
         lock.unlock()
     }
 
-    /// ExpTech immutable tiles only (basemap / radar / sat / DPM). Glyphs and
-    /// other `*.pbf` must NOT match — those still go through native HTTP.
+    /// ExpTech immutable tiles only (basemap / radar / sat / DPM).
     static func isTileUrl(_ url: String) -> Bool {
         if url.contains("/api/v1/map/tiles/") { return true }
         if url.contains("/api/v2/tiles/") { return true }
@@ -56,5 +54,28 @@ enum MapLibreDartTileBridge {
             payload["contentType"] as? String,
             payload["etag"] as? String
         )
+    }
+
+    /// Fire-and-forget: persist a network-fetched tile into Dart SQLite.
+    static func putAsync(
+        url: String,
+        data: Data,
+        contentType: String?,
+        etag: String?
+    ) {
+        guard isTileUrl(url) else { return }
+        lock.lock()
+        let ch = channel
+        lock.unlock()
+        guard let ch else { return }
+        var args: [String: Any] = [
+            "url": url,
+            "data": FlutterStandardTypedData(bytes: data),
+        ]
+        if let contentType { args["contentType"] = contentType }
+        if let etag { args["etag"] = etag }
+        DispatchQueue.main.async {
+            ch.invokeMethod("put", arguments: args)
+        }
     }
 }
