@@ -2,16 +2,34 @@ package org.maplibre.maplibregl;
 
 import org.maplibre.android.module.http.HttpRequestUtil;
 import io.flutter.plugin.common.MethodChannel;
+import java.io.IOException;
+import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 import okhttp3.Dispatcher;
+import okhttp3.Interceptor;
+import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
+import okhttp3.Protocol;
 import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 
 abstract class MapLibreHttpRequestUtil {
 
   private static Map<String, String> currentHeaders;
+  private static List<String> currentFilter;
   private static Integer currentMaxRequests;
   private static Integer currentMaxRequestsPerHost;
+  private static final int MAX_PUT_BYTES = 2 * 1024 * 1024;
+
+  public static void install() {
+    try {
+      rebuildClient();
+    } catch (RuntimeException ignored) {
+      // Best-effort at plugin attach.
+    }
+  }
 
   public static void setHttpHeaders(Map<String, String> headers, MethodChannel.Result result) {
     currentHeaders = headers;
@@ -23,11 +41,20 @@ abstract class MapLibreHttpRequestUtil {
     }
   }
 
+  public static void setCustomHeaders(
+      Map<String, String> headers, List<String> filter, MethodChannel.Result result) {
+    currentHeaders = headers;
+    currentFilter = filter;
+    try {
+      rebuildClient();
+      result.success(null);
+    } catch (RuntimeException e) {
+      result.error("SetCustomHeadersError", e.getMessage(), null);
+    }
+  }
+
   public static void setMaxConcurrentRequests(
       Integer maxRequests, Integer maxRequestsPerHost, MethodChannel.Result result) {
-    // OkHttp's Dispatcher throws IllegalArgumentException for values < 1.
-    // Validate before mutating state so a rejected call doesn't leave the
-    // static fields half-updated.
     if (maxRequests != null && maxRequests < 1) {
       result.error(
           "InvalidMaxRequests",
@@ -55,7 +82,6 @@ abstract class MapLibreHttpRequestUtil {
   private static void rebuildClient() {
     OkHttpClient.Builder builder = new OkHttpClient.Builder();
 
-    // Apply dispatcher configuration
     if (currentMaxRequests != null || currentMaxRequestsPerHost != null) {
       Dispatcher dispatcher = new Dispatcher();
       if (currentMaxRequests != null) {
@@ -67,25 +93,80 @@ abstract class MapLibreHttpRequestUtil {
       builder.dispatcher(dispatcher);
     }
 
-    // Apply header interceptor
-    if (currentHeaders != null) {
-      builder.addNetworkInterceptor(
-          chain -> {
-            Request.Builder reqBuilder = chain.request().newBuilder();
-            for (Map.Entry<String, String> header : currentHeaders.entrySet()) {
-              if (header.getKey() == null || header.getKey().trim().isEmpty()) {
-                continue;
-              }
-              if (header.getValue() == null || header.getValue().trim().isEmpty()) {
-                reqBuilder.removeHeader(header.getKey());
-              } else {
-                reqBuilder.header(header.getKey(), header.getValue());
-              }
-            }
-            return chain.proceed(reqBuilder.build());
-          });
-    }
+    builder.addInterceptor(MapLibreHttpRequestUtil::serveFromDart);
+    builder.addNetworkInterceptor(MapLibreHttpRequestUtil::applyHeadersAndPut);
 
     HttpRequestUtil.setOkHttpClient(builder.build());
+  }
+
+  private static Response serveFromDart(Interceptor.Chain chain) throws IOException {
+    Request request = chain.request();
+    String url = request.url().toString();
+    MapLibreDartTileBridge.Entry hit = MapLibreDartTileBridge.get(url);
+    if (hit != null) {
+      MediaType mediaType =
+          MediaType.parse(
+              hit.contentType != null ? hit.contentType : "application/octet-stream");
+      Response.Builder rb =
+          new Response.Builder()
+              .request(request)
+              .protocol(Protocol.HTTP_1_1)
+              .code(200)
+              .message("OK")
+              .body(ResponseBody.create(hit.data, mediaType))
+              .header(
+                  "Content-Type",
+                  hit.contentType != null ? hit.contentType : "application/octet-stream")
+              .header("Content-Length", String.valueOf(hit.data.length));
+      if (hit.etag != null) {
+        rb.header("ETag", hit.etag);
+      }
+      return rb.build();
+    }
+    return chain.proceed(request);
+  }
+
+  private static Response applyHeadersAndPut(Interceptor.Chain chain) throws IOException {
+    Request.Builder reqBuilder = chain.request().newBuilder();
+    String url = chain.request().url().toString();
+
+    if (currentHeaders != null) {
+      boolean shouldApply = currentFilter == null || currentFilter.isEmpty();
+      if (!shouldApply && currentFilter != null) {
+        for (String pattern : currentFilter) {
+          if (Pattern.matches(pattern, url)) {
+            shouldApply = true;
+            break;
+          }
+        }
+      }
+      if (shouldApply) {
+        for (Map.Entry<String, String> header : currentHeaders.entrySet()) {
+          if (header.getKey() == null || header.getKey().trim().isEmpty()) {
+            continue;
+          }
+          if (header.getValue() == null || header.getValue().trim().isEmpty()) {
+            reqBuilder.removeHeader(header.getKey());
+          } else {
+            reqBuilder.header(header.getKey(), header.getValue());
+          }
+        }
+      }
+    }
+
+    Response response = chain.proceed(reqBuilder.build());
+    if (response.code() == 200
+        && response.body() != null
+        && MapLibreDartTileBridge.isTileUrl(url)) {
+      ResponseBody body = response.body();
+      long contentLength = body.contentLength();
+      if (contentLength >= 0 && contentLength <= MAX_PUT_BYTES) {
+        byte[] bytes = body.bytes();
+        MapLibreDartTileBridge.putAsync(
+            url, bytes, response.header("Content-Type"), response.header("ETag"));
+        return response.newBuilder().body(ResponseBody.create(bytes, body.contentType())).build();
+      }
+    }
+    return response;
   }
 }

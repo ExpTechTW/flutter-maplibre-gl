@@ -21,6 +21,9 @@ public class MapLibreMapsPlugin: NSObject, FlutterPlugin {
             + (sessionConfig.protocolClasses ?? [])
         MLNNetworkConfiguration.sharedManager.sessionConfiguration = sessionConfig
 
+        // Native → Dart tile get/put (Dart owns cache + metering).
+        MapLibreDartTileBridge.attach(messenger: registrar.messenger())
+
         let channel = FlutterMethodChannel(
             name: "plugins.flutter.io/maplibre_gl",
             binaryMessenger: registrar.messenger()

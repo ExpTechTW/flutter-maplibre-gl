@@ -73,6 +73,58 @@ Future<void> setHttpHeaders(Map<String, String> headers) {
   );
 }
 
+const _tileCacheChannel = MethodChannel('plugins.flutter.io/maplibre_gl/tile_cache');
+
+/// Called by native when MapLibre needs a tile body. Return
+/// `{data, contentType?, etag?}` on hit, or `null` on miss.
+typedef MapLibreTileCacheGet =
+    Future<Map<String, Object?>?> Function(String url);
+
+/// Called by native after a live tile download so Dart can persist + meter.
+typedef MapLibreTileCachePut =
+    Future<void> Function(
+      String url,
+      Uint8List data, {
+      String? contentType,
+      String? etag,
+    });
+
+/// Binds Dart as the tile cache authority for MapLibre HTTPS intercepts.
+///
+/// Native only asks / reports — memory LRU, SQLite, and [NetworkUsage]-style
+/// metering stay in Dart.
+Future<void> bindMapLibreTileCache({
+  required MapLibreTileCacheGet get,
+  required MapLibreTileCachePut put,
+}) async {
+  _tileCacheChannel.setMethodCallHandler((call) async {
+    switch (call.method) {
+      case 'get':
+        final args = Map<String, Object?>.from(call.arguments as Map);
+        final url = args['url'] as String;
+        return get(url);
+      case 'put':
+        final args = Map<String, Object?>.from(call.arguments as Map);
+        final url = args['url'] as String;
+        final raw = args['data'];
+        final Uint8List data = switch (raw) {
+          Uint8List u => u,
+          List<int> l => Uint8List.fromList(l),
+          _ => throw ArgumentError('putTileCache data must be bytes'),
+        };
+        await put(
+          url,
+          data,
+          contentType: args['contentType'] as String?,
+          etag: args['etag'] as String?,
+        );
+        return null;
+      default:
+        throw MissingPluginException(call.method);
+    }
+  });
+}
+
 Future<List<OfflineRegion>> mergeOfflineRegions(String path) async {
   final String regionsJson = await _globalChannel.invokeMethod(
     'mergeOfflineRegions',

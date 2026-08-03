@@ -43,6 +43,10 @@ public class MapLibreMapsPlugin implements FlutterPlugin, ActivityAware {
         new MethodChannel(binding.getBinaryMessenger(), "plugins.flutter.io/maplibre_gl");
     methodChannel.setMethodCallHandler(new GlobalMethodHandler(binding));
 
+    // Native → Dart tile get/put (Dart owns cache + metering).
+    MapLibreDartTileBridge.attach(binding.getBinaryMessenger());
+    MapLibreHttpRequestUtil.install();
+
     binding
         .getPlatformViewRegistry()
         .registerViewFactory(
