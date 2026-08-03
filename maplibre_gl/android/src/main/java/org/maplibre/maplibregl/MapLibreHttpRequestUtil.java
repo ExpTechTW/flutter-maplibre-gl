@@ -21,7 +21,6 @@ abstract class MapLibreHttpRequestUtil {
   private static List<String> currentFilter;
   private static Integer currentMaxRequests;
   private static Integer currentMaxRequestsPerHost;
-  private static final int MAX_PUT_BYTES = 2 * 1024 * 1024;
 
   public static void install() {
     try {
@@ -98,15 +97,25 @@ abstract class MapLibreHttpRequestUtil {
       builder.dispatcher(dispatcher);
     }
 
-    builder.addInterceptor(MapLibreHttpRequestUtil::serveFromDart);
-    builder.addNetworkInterceptor(MapLibreHttpRequestUtil::applyHeadersAndPut);
+    // Application interceptor: ExpTech tiles from Dart only; everything else
+    // proceeds (with optional header injection on the network interceptor).
+    builder.addInterceptor(MapLibreHttpRequestUtil::serveTilesFromDartOnly);
+    builder.addNetworkInterceptor(MapLibreHttpRequestUtil::applyHeaders);
 
     HttpRequestUtil.setOkHttpClient(builder.build());
   }
 
-  private static Response serveFromDart(Interceptor.Chain chain) throws IOException {
+  /**
+   * ExpTech tiles never hit the network from MapLibre — Dart Dio + AmbientPrefetch
+   * owns that. Soft-miss returns 404 so MapLibre can retry after prefetch.
+   */
+  private static Response serveTilesFromDartOnly(Interceptor.Chain chain) throws IOException {
     Request request = chain.request();
     String url = request.url().toString();
+    if (!MapLibreDartTileBridge.isTileUrl(url)) {
+      return chain.proceed(request);
+    }
+
     MapLibreDartTileBridge.Entry hit = MapLibreDartTileBridge.get(url);
     if (hit != null) {
       MediaType mediaType =
@@ -128,10 +137,18 @@ abstract class MapLibreHttpRequestUtil {
       }
       return rb.build();
     }
-    return chain.proceed(request);
+
+    return new Response.Builder()
+        .request(request)
+        .protocol(Protocol.HTTP_1_1)
+        .code(404)
+        .message("Not Found")
+        .body(ResponseBody.create(new byte[0], MediaType.parse("application/octet-stream")))
+        .header("Content-Length", "0")
+        .build();
   }
 
-  private static Response applyHeadersAndPut(Interceptor.Chain chain) throws IOException {
+  private static Response applyHeaders(Interceptor.Chain chain) throws IOException {
     Request.Builder reqBuilder = chain.request().newBuilder();
     String url = chain.request().url().toString();
 
@@ -159,19 +176,6 @@ abstract class MapLibreHttpRequestUtil {
       }
     }
 
-    Response response = chain.proceed(reqBuilder.build());
-    if (response.code() == 200
-        && response.body() != null
-        && MapLibreDartTileBridge.isTileUrl(url)) {
-      ResponseBody body = response.body();
-      long contentLength = body.contentLength();
-      if (contentLength >= 0 && contentLength <= MAX_PUT_BYTES) {
-        byte[] bytes = body.bytes();
-        MapLibreDartTileBridge.putAsync(
-            url, bytes, response.header("Content-Type"), response.header("ETag"));
-        return response.newBuilder().body(ResponseBody.create(bytes, body.contentType())).build();
-      }
-    }
-    return response;
+    return chain.proceed(reqBuilder.build());
   }
 }

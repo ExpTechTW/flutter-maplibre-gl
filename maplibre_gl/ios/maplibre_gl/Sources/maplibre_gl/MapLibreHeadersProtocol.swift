@@ -1,16 +1,14 @@
 import Foundation
 
 // URLProtocol that:
-// 1. Asks Dart for tile bodies (Dart owns cache + metering)
-// 2. Injects custom headers on live requests
-// 3. On a live tile miss, forwards the body to Dart for persist/meter
+// 1. Serves ExpTech tiles only from Dart (Dio + SQLite) — never native-fetch
+// 2. Injects custom headers on all other live requests (style / glyphs / …)
 //
 // Forwarding uses ONE shared ephemeral URLSession with `protocolClasses = []`
 // (no recursion, no per-request session). Creating + invalidate'ing a session
 // per tile previously UAF'd on `com.apple.network.connections` / objc_retain.
 final class MapLibreHeadersProtocol: URLProtocol {
     private static let handledKey = "MapLibreHeadersProtocolHandled"
-    private static let maxPutBytes = 2 * 1024 * 1024
 
     /// Shared forwarder — never invalidate; cancel tasks only.
     private static let forwardSession: URLSession = {
@@ -39,22 +37,36 @@ final class MapLibreHeadersProtocol: URLProtocol {
 
     override func startLoading() {
         let urlString = request.url?.absoluteString ?? ""
-        if let hit = MapLibreDartTileBridge.get(url: urlString), let url = request.url {
-            var headers: [String: String] = [
-                "Content-Type": hit.contentType ?? "application/octet-stream",
-                "Content-Length": "\(hit.data.count)",
-            ]
-            if let etag = hit.etag {
-                headers["ETag"] = etag
+
+        // ExpTech tiles: Dart Dio is the only network path. Miss → 404 (empty),
+        // MapLibre will retry after AmbientPrefetch lands the row.
+        if MapLibreDartTileBridge.isTileUrl(urlString), let url = request.url {
+            if let hit = MapLibreDartTileBridge.get(url: urlString) {
+                var headers: [String: String] = [
+                    "Content-Type": hit.contentType ?? "application/octet-stream",
+                    "Content-Length": "\(hit.data.count)",
+                ]
+                if let etag = hit.etag {
+                    headers["ETag"] = etag
+                }
+                let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: headers
+                )!
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: hit.data)
+                client?.urlProtocolDidFinishLoading(self)
+                return
             }
             let response = HTTPURLResponse(
                 url: url,
-                statusCode: 200,
+                statusCode: 404,
                 httpVersion: "HTTP/1.1",
-                headerFields: headers
+                headerFields: ["Content-Length": "0"]
             )!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: hit.data)
             client?.urlProtocolDidFinishLoading(self)
             return
         }
@@ -90,7 +102,6 @@ final class MapLibreHeadersProtocol: URLProtocol {
         activeTask = nil
 
         if let error {
-            // Cancellation after stopLoading — don't touch the client.
             if (error as NSError).code == NSURLErrorCancelled { return }
             client?.urlProtocol(self, didFailWithError: error)
             return
@@ -109,21 +120,6 @@ final class MapLibreHeadersProtocol: URLProtocol {
         if !body.isEmpty {
             client?.urlProtocol(self, didLoad: body)
         }
-
-        if let http = response as? HTTPURLResponse,
-           http.statusCode == 200,
-           !body.isEmpty,
-           body.count <= Self.maxPutBytes,
-           let url = http.url?.absoluteString ?? request.url?.absoluteString
-        {
-            MapLibreDartTileBridge.putAsync(
-                url: url,
-                data: body,
-                contentType: http.value(forHTTPHeaderField: "Content-Type"),
-                etag: http.value(forHTTPHeaderField: "ETag")
-            )
-        }
-
         client?.urlProtocolDidFinishLoading(self)
     }
 }
