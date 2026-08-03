@@ -2,24 +2,41 @@ package org.maplibre.maplibregl;
 
 import android.os.Handler;
 import android.os.Looper;
-import android.util.LruCache;
 import androidx.annotation.Nullable;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodChannel;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Thin bridge: Dart owns SQLite + metering. Native asks {@code get} before
- * fetch and {@code put} after a tile miss download.
+ * Dart owns the tile cache (SQLite + traffic metering); native owns only a bounded in-process
+ * mirror.
  *
- * <p>A process-local {@link LruCache} sits in front of the MethodChannel so a
- * radar settle does not serialize every hit through Flutter's main isolate.
+ * <p>Three rules are what let a radar timeline scrub at finger speed:
+ *
+ * <ol>
+ *   <li><b>Memory first.</b> A repeat request for a tile already seen this session is answered with
+ *       zero IPC.
+ *   <li><b>Batched lookups.</b> Misses are coalesced by URL into one {@code getBatch} per ~6 ms
+ *       window, so a viewport of tiles costs one message and one SQLite query instead of dozens of
+ *       independent round-trips. Only OkHttp's own dispatcher threads ever wait, never MapLibre's
+ *       map thread.
+ *   <li><b>Batched writes.</b> Network bodies buffer and flush as one {@code putBatch}.
+ * </ol>
+ *
+ * <p>Dart may also push bytes ahead of demand ({@code injectTiles}) — the warm path a timeline uses
+ * so the next frame is a memory hit <i>before</i> it is revealed.
  */
 final class MapLibreDartTileBridge {
+
+  /** One cached tile body plus the response metadata needed to replay it. */
   static final class Entry {
     final byte[] data;
     @Nullable final String contentType;
@@ -32,34 +49,168 @@ final class MapLibreDartTileBridge {
     }
   }
 
-  private static final Object lock = new Object();
+  /** Coalescing window for {@code getBatch} — well under a network round-trip. */
+  private static final long GET_WINDOW_MS = 6;
+
+  private static final int MAX_GET_BATCH = 64;
+  private static final long GET_TIMEOUT_MS = 2500;
+  private static final long PUT_WINDOW_MS = 250;
+  private static final int MAX_PUT_BATCH = 32;
+  private static final int DEFAULT_MEMORY_LIMIT = 64 * 1024 * 1024;
+
+  private static final Object channelLock = new Object();
   private static MethodChannel channel;
   private static final Handler main = new Handler(Looper.getMainLooper());
-  private static final long GET_TIMEOUT_MS = 100;
-  private static final LruCache<String, Entry> mem =
-      new LruCache<String, Entry>(32 * 1024 * 1024) {
-        @Override
-        protected int sizeOf(String key, Entry value) {
-          return value.data.length;
-        }
-      };
+
+  private static final MemStore mem = new MemStore(DEFAULT_MEMORY_LIMIT);
+
+  /** Pending lookups, deduped by URL — concurrent requests share one round-trip. */
+  private static final Object batchLock = new Object();
+
+  private static final LinkedHashMap<String, Waiter> pendingGets = new LinkedHashMap<>();
+  private static boolean getFlushScheduled = false;
+  private static final LinkedHashMap<String, Entry> pendingPuts = new LinkedHashMap<>();
+  private static boolean putFlushScheduled = false;
 
   private MapLibreDartTileBridge() {}
+
+  /** A shared lookup: every caller for the same URL blocks on one latch. */
+  private static final class Waiter {
+    final CountDownLatch latch = new CountDownLatch(1);
+    final AtomicReference<Entry> value = new AtomicReference<>(null);
+
+    void settle(@Nullable Entry entry) {
+      value.set(entry);
+      latch.countDown();
+    }
+  }
+
+  /** Bounded LRU by byte cost. Enumerable so Dart can evict a frame's tiles by URL substring. */
+  private static final class MemStore {
+    private final LinkedHashMap<String, Entry> map = new LinkedHashMap<>(64, 0.75f, true);
+    private int bytes = 0;
+    private int limit;
+
+    MemStore(int limit) {
+      this.limit = limit;
+    }
+
+    synchronized void setLimit(int newLimit) {
+      limit = Math.max(0, newLimit);
+      trim();
+    }
+
+    @Nullable
+    synchronized Entry get(String url) {
+      return map.get(url);
+    }
+
+    synchronized boolean contains(String url) {
+      return map.containsKey(url);
+    }
+
+    synchronized void put(String url, Entry entry) {
+      Entry previous = map.put(url, entry);
+      if (previous != null) bytes -= previous.data.length;
+      bytes += entry.data.length;
+      trim();
+    }
+
+    /** Drops every entry whose URL contains one of {@code needles}; empty drops all. */
+    synchronized void evict(List<String> needles) {
+      if (needles == null || needles.isEmpty()) {
+        map.clear();
+        bytes = 0;
+        return;
+      }
+      Iterator<Map.Entry<String, Entry>> it = map.entrySet().iterator();
+      while (it.hasNext()) {
+        Map.Entry<String, Entry> row = it.next();
+        for (String needle : needles) {
+          if (row.getKey().contains(needle)) {
+            bytes -= row.getValue().data.length;
+            it.remove();
+            break;
+          }
+        }
+      }
+    }
+
+    private void trim() {
+      Iterator<Map.Entry<String, Entry>> it = map.entrySet().iterator();
+      while (bytes > limit && it.hasNext()) {
+        bytes -= it.next().getValue().data.length;
+        it.remove();
+      }
+    }
+  }
 
   static void attach(BinaryMessenger messenger) {
     MethodChannel ch =
         new MethodChannel(messenger, "plugins.flutter.io/maplibre_gl/tile_cache");
     ch.setMethodCallHandler(
         (call, result) -> {
-          if ("cancelPendingFetches".equals(call.method)) {
-            MapLibreHttpRequestUtil.cancelPendingFetches();
-            result.success(null);
-          } else {
-            result.notImplemented();
+          switch (call.method) {
+            case "injectTiles":
+              {
+                List<Map<String, Object>> entries = call.argument("entries");
+                if (entries != null) {
+                  for (Map<String, Object> row : entries) {
+                    Object url = row.get("url");
+                    Object data = row.get("data");
+                    if (url instanceof String && data instanceof byte[]) {
+                      mem.put(
+                          (String) url,
+                          new Entry(
+                              (byte[]) data,
+                              (String) row.get("contentType"),
+                              (String) row.get("etag")));
+                    }
+                  }
+                }
+                result.success(null);
+                return;
+              }
+            case "filterMissing":
+              {
+                List<String> urls = call.argument("urls");
+                List<String> missing = new ArrayList<>();
+                if (urls != null) {
+                  for (String url : urls) {
+                    if (!mem.contains(url)) missing.add(url);
+                  }
+                }
+                result.success(missing);
+                return;
+              }
+            case "evictTiles":
+              mem.evict(call.argument("contains"));
+              result.success(null);
+              return;
+            case "setMemoryLimit":
+              {
+                Integer bytes = call.argument("bytes");
+                mem.setLimit(bytes != null ? bytes : DEFAULT_MEMORY_LIMIT);
+                result.success(null);
+                return;
+              }
+            case "cancelPendingFetches":
+              MapLibreHttpRequestUtil.cancelPendingFetches(call.argument("contains"));
+              result.success(null);
+              return;
+            default:
+              result.notImplemented();
           }
         });
-    synchronized (lock) {
+    synchronized (channelLock) {
       channel = ch;
+    }
+  }
+
+  @Nullable
+  private static MethodChannel activeChannel() {
+    synchronized (channelLock) {
+      return channel;
     }
   }
 
@@ -70,83 +221,145 @@ final class MapLibreDartTileBridge {
     return url.contains("/api/v2/tiles/");
   }
 
+  /**
+   * Resolves {@code url} from memory, else from Dart via a batched lookup.
+   *
+   * <p>Returns {@code null} for "not cached, go to the network". Called from OkHttp dispatcher
+   * threads only — MapLibre's map thread never reaches here.
+   */
   @Nullable
   static Entry get(String url) {
     if (!isTileUrl(url)) return null;
-    Entry cached = mem.get(url);
-    if (cached != null) return cached;
+    Entry hit = mem.get(url);
+    if (hit != null) return hit;
+    if (activeChannel() == null) return null;
 
-    final MethodChannel ch;
-    synchronized (lock) {
-      ch = channel;
+    Waiter waiter;
+    boolean flushNow = false;
+    synchronized (batchLock) {
+      Waiter existing = pendingGets.get(url);
+      if (existing != null) {
+        waiter = existing;
+      } else {
+        waiter = new Waiter();
+        pendingGets.put(url, waiter);
+        if (pendingGets.size() >= MAX_GET_BATCH) {
+          flushNow = true;
+        } else if (!getFlushScheduled) {
+          getFlushScheduled = true;
+          main.postDelayed(MapLibreDartTileBridge::flushGets, GET_WINDOW_MS);
+        }
+      }
     }
-    if (ch == null) return null;
+    if (flushNow) flushGets();
 
-    CountDownLatch latch = new CountDownLatch(1);
-    AtomicReference<Entry> out = new AtomicReference<>(null);
+    try {
+      if (!waiter.latch.await(GET_TIMEOUT_MS, TimeUnit.MILLISECONDS)) return null;
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return null;
+    }
+    return waiter.value.get();
+  }
+
+  private static void flushGets() {
+    final LinkedHashMap<String, Waiter> batch;
+    synchronized (batchLock) {
+      getFlushScheduled = false;
+      if (pendingGets.isEmpty()) return;
+      batch = new LinkedHashMap<>(pendingGets);
+      pendingGets.clear();
+    }
+    MethodChannel ch = activeChannel();
+    if (ch == null) {
+      for (Waiter waiter : batch.values()) waiter.settle(null);
+      return;
+    }
+
+    Map<String, Object> args = new HashMap<>();
+    args.put("urls", new ArrayList<>(batch.keySet()));
     main.post(
         () ->
             ch.invokeMethod(
-                "get",
-                mapOf("url", url),
+                "getBatch",
+                args,
                 new MethodChannel.Result() {
                   @Override
                   public void success(@Nullable Object result) {
-                    if (result instanceof Map) {
-                      @SuppressWarnings("unchecked")
-                      Map<String, Object> m = (Map<String, Object>) result;
-                      Object data = m.get("data");
-                      if (data instanceof byte[]) {
-                        Entry entry =
-                            new Entry(
-                                (byte[]) data,
-                                (String) m.get("contentType"),
-                                (String) m.get("etag"));
-                        mem.put(url, entry);
-                        out.set(entry);
+                    Map<?, ?> payload = result instanceof Map ? (Map<?, ?>) result : null;
+                    for (Map.Entry<String, Waiter> row : batch.entrySet()) {
+                      Entry entry = null;
+                      Object raw = payload == null ? null : payload.get(row.getKey());
+                      if (raw instanceof Map) {
+                        Map<?, ?> hit = (Map<?, ?>) raw;
+                        Object data = hit.get("data");
+                        if (data instanceof byte[]) {
+                          entry =
+                              new Entry(
+                                  (byte[]) data,
+                                  (String) hit.get("contentType"),
+                                  (String) hit.get("etag"));
+                          mem.put(row.getKey(), entry);
+                        }
                       }
+                      row.getValue().settle(entry);
                     }
-                    latch.countDown();
                   }
 
                   @Override
                   public void error(String code, String msg, Object details) {
-                    latch.countDown();
+                    for (Waiter waiter : batch.values()) waiter.settle(null);
                   }
 
                   @Override
                   public void notImplemented() {
-                    latch.countDown();
+                    for (Waiter waiter : batch.values()) waiter.settle(null);
                   }
                 }));
-    try {
-      latch.await(GET_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-    }
-    return out.get();
   }
 
-  static void putAsync(
+  /** Records a network-fetched tile: memory now, Dart on the next batch flush. */
+  static void put(
       String url, byte[] data, @Nullable String contentType, @Nullable String etag) {
     if (!isTileUrl(url) || data == null) return;
     mem.put(url, new Entry(data, contentType, etag));
-    final MethodChannel ch;
-    synchronized (lock) {
-      ch = channel;
+    if (activeChannel() == null) return;
+
+    boolean flushNow = false;
+    synchronized (batchLock) {
+      pendingPuts.put(url, new Entry(data, contentType, etag));
+      if (pendingPuts.size() >= MAX_PUT_BATCH) {
+        flushNow = true;
+      } else if (!putFlushScheduled) {
+        putFlushScheduled = true;
+        main.postDelayed(MapLibreDartTileBridge::flushPuts, PUT_WINDOW_MS);
+      }
     }
-    if (ch == null) return;
-    Map<String, Object> args = new HashMap<>();
-    args.put("url", url);
-    args.put("data", data);
-    if (contentType != null) args.put("contentType", contentType);
-    if (etag != null) args.put("etag", etag);
-    main.post(() -> ch.invokeMethod("put", args));
+    if (flushNow) flushPuts();
   }
 
-  private static Map<String, Object> mapOf(String k, Object v) {
-    Map<String, Object> m = new HashMap<>();
-    m.put(k, v);
-    return m;
+  private static void flushPuts() {
+    final LinkedHashMap<String, Entry> batch;
+    synchronized (batchLock) {
+      putFlushScheduled = false;
+      if (pendingPuts.isEmpty()) return;
+      batch = new LinkedHashMap<>(pendingPuts);
+      pendingPuts.clear();
+    }
+    MethodChannel ch = activeChannel();
+    if (ch == null) return;
+
+    List<Map<String, Object>> entries = new ArrayList<>(batch.size());
+    for (Map.Entry<String, Entry> row : batch.entrySet()) {
+      Map<String, Object> item = new HashMap<>();
+      item.put("url", row.getKey());
+      item.put("data", row.getValue().data);
+      if (row.getValue().contentType != null) item.put("contentType", row.getValue().contentType);
+      if (row.getValue().etag != null) item.put("etag", row.getValue().etag);
+      entries.add(item);
+    }
+    Map<String, Object> args = new HashMap<>();
+    args.put("entries", entries);
+    main.post(() -> ch.invokeMethod("putBatch", args));
   }
 }

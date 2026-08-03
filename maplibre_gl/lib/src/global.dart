@@ -75,49 +75,75 @@ Future<void> setHttpHeaders(Map<String, String> headers) {
 
 const _tileCacheChannel = MethodChannel('plugins.flutter.io/maplibre_gl/tile_cache');
 
-/// Called by native when MapLibre needs a tile body. Return
-/// `{data, contentType?, etag?}` on hit, or `null` on miss.
-typedef MapLibreTileCacheGet =
-    Future<Map<String, Object?>?> Function(String url);
+/// One cached tile body plus the response metadata needed to replay it.
+///
+/// The unit of exchange in both directions: Dart answers a lookup with these,
+/// and pushes them ahead of demand via [injectMapLibreTiles].
+class MapLibreTile {
+  const MapLibreTile({
+    required this.url,
+    required this.data,
+    this.contentType,
+    this.etag,
+  });
 
-/// Called by native after a live tile download so Dart can persist + meter.
-typedef MapLibreTileCachePut =
-    Future<void> Function(
-      String url,
-      Uint8List data, {
-      String? contentType,
-      String? etag,
-    });
+  final String url;
+  final Uint8List data;
+  final String? contentType;
+  final String? etag;
+
+  Map<String, Object?> _toWire() => <String, Object?>{
+    'url': url,
+    'data': data,
+    if (contentType != null) 'contentType': contentType,
+    if (etag != null) 'etag': etag,
+  };
+}
+
+/// Called by native when MapLibre needs tile bodies it does not hold.
+///
+/// Requests arrive **batched** — native coalesces the tiles a viewport asks for
+/// into one call — so the implementation should answer with a single store
+/// lookup. Return only the URLs that hit; anything absent is treated as a miss
+/// and fetched from the network.
+typedef MapLibreTileCacheGetBatch =
+    Future<List<MapLibreTile>> Function(List<String> urls);
+
+/// Called by native after live tile downloads so Dart can persist + meter.
+/// Also batched.
+typedef MapLibreTileCachePutBatch =
+    Future<void> Function(List<MapLibreTile> tiles);
 
 /// Binds Dart as the tile cache authority for MapLibre HTTPS intercepts.
 ///
-/// Native only asks / reports — memory LRU, SQLite, and [NetworkUsage]-style
-/// metering stay in Dart.
+/// Native keeps only a bounded in-process mirror and never blocks a loader
+/// thread waiting on Flutter — persistence, eviction policy, and
+/// traffic metering all stay in Dart.
 Future<void> bindMapLibreTileCache({
-  required MapLibreTileCacheGet get,
-  required MapLibreTileCachePut put,
+  required MapLibreTileCacheGetBatch getBatch,
+  required MapLibreTileCachePutBatch putBatch,
 }) async {
   _tileCacheChannel.setMethodCallHandler((call) async {
     switch (call.method) {
-      case 'get':
+      case 'getBatch':
         final args = Map<String, Object?>.from(call.arguments as Map);
-        final url = args['url'] as String;
-        return get(url);
-      case 'put':
-        final args = Map<String, Object?>.from(call.arguments as Map);
-        final url = args['url'] as String;
-        final raw = args['data'];
-        final Uint8List data = switch (raw) {
-          Uint8List u => u,
-          List<int> l => Uint8List.fromList(l),
-          _ => throw ArgumentError('putTileCache data must be bytes'),
+        final urls = (args['urls'] as List).cast<String>();
+        final hits = await getBatch(urls);
+        return <String, Object?>{
+          for (final hit in hits)
+            hit.url: <String, Object?>{
+              'data': hit.data,
+              'contentType': hit.contentType,
+              'etag': hit.etag,
+            },
         };
-        await put(
-          url,
-          data,
-          contentType: args['contentType'] as String?,
-          etag: args['etag'] as String?,
-        );
+      case 'putBatch':
+        final args = Map<String, Object?>.from(call.arguments as Map);
+        final entries = (args['entries'] as List).cast<Object?>();
+        await putBatch([
+          for (final entry in entries)
+            if (_tileFromWire(entry) case final tile?) tile,
+        ]);
         return null;
       default:
         throw MissingPluginException(call.method);
@@ -125,11 +151,99 @@ Future<void> bindMapLibreTileCache({
   });
 }
 
-/// Cancels in-flight native tile HTTP (URLSession / OkHttp) for abandoned
-/// radar/satellite frames after a scrub. Best-effort; safe anytime.
-Future<void> cancelMapLibreTileFetches() async {
+MapLibreTile? _tileFromWire(Object? entry) {
+  if (entry is! Map) return null;
+  final row = Map<Object?, Object?>.from(entry);
+  final url = row['url'];
+  final raw = row['data'];
+  if (url is! String) return null;
+  final Uint8List? data = switch (raw) {
+    Uint8List u => u,
+    List<int> l => Uint8List.fromList(l),
+    _ => null,
+  };
+  if (data == null) return null;
+  return MapLibreTile(
+    url: url,
+    data: data,
+    contentType: row['contentType'] as String?,
+    etag: row['etag'] as String?,
+  );
+}
+
+/// Pushes [tiles] into native's in-process mirror so the next request for them
+/// resolves with **no IPC and no network**.
+///
+/// This is the warm path: a timeline that knows which frame the finger is
+/// heading for injects its tiles before revealing it, turning a scrub into
+/// pure compositing. Pair with [mapLibreTilesMissing] to avoid re-sending
+/// bytes native already holds.
+Future<void> injectMapLibreTiles(List<MapLibreTile> tiles) async {
+  if (tiles.isEmpty) return;
   try {
-    await _tileCacheChannel.invokeMethod<void>('cancelPendingFetches');
+    await _tileCacheChannel.invokeMethod<void>('injectTiles', {
+      'entries': [for (final tile in tiles) tile._toWire()],
+    });
+  } catch (_) {
+    // Plugin not attached / binding not ready (tests, early bootstrap).
+  }
+}
+
+/// The subset of [urls] native does **not** currently hold in memory.
+///
+/// Cheap (strings only) next to shipping tile bodies, so callers filter with
+/// this before [injectMapLibreTiles].
+Future<List<String>> mapLibreTilesMissing(List<String> urls) async {
+  if (urls.isEmpty) return const [];
+  try {
+    final missing = await _tileCacheChannel.invokeMethod<List<Object?>>(
+      'filterMissing',
+      {'urls': urls},
+    );
+    return missing?.cast<String>() ?? urls;
+  } catch (_) {
+    return urls;
+  }
+}
+
+/// Caps native's in-process tile mirror at [bytes] (LRU beyond that).
+///
+/// This is a *memory* budget in front of the Dart store, unrelated to
+/// MapLibre's own ambient/offline database.
+Future<void> setMapLibreTileMemoryLimit(int bytes) async {
+  try {
+    await _tileCacheChannel.invokeMethod<void>('setMemoryLimit', {
+      'bytes': bytes,
+    });
+  } catch (_) {
+    // Plugin not attached / binding not ready (tests, early bootstrap).
+  }
+}
+
+/// Drops tiles whose URL contains one of [urlContains] from native's mirror.
+Future<void> evictMapLibreTiles(List<String> urlContains) async {
+  try {
+    await _tileCacheChannel.invokeMethod<void>('evictTiles', {
+      'contains': urlContains,
+    });
+  } catch (_) {
+    // Plugin not attached / binding not ready (tests, early bootstrap).
+  }
+}
+
+/// Cancels in-flight native tile HTTP (URLSession / OkHttp).
+///
+/// Pass [urlContains] to scope the cancel to abandoned frames — a scrub must
+/// not take the basemap and the frame the finger landed on down with it. An
+/// empty list cancels everything. Best-effort; safe anytime. Resolves once the
+/// cancels have been applied.
+Future<void> cancelMapLibreTileFetches({
+  List<String> urlContains = const [],
+}) async {
+  try {
+    await _tileCacheChannel.invokeMethod<void>('cancelPendingFetches', {
+      'contains': urlContains,
+    });
   } catch (_) {
     // Plugin not attached / binding not ready (tests, early bootstrap).
   }

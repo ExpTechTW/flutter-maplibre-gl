@@ -1,5 +1,6 @@
 package org.maplibre.maplibregl;
 
+import androidx.annotation.Nullable;
 import org.maplibre.android.module.http.HttpRequestUtil;
 import io.flutter.plugin.common.MethodChannel;
 import java.io.IOException;
@@ -7,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
 import java.util.concurrent.TimeUnit;
+import okhttp3.Call;
 import okhttp3.Dispatcher;
 import okhttp3.Interceptor;
 import okhttp3.MediaType;
@@ -23,6 +25,18 @@ abstract class MapLibreHttpRequestUtil {
   private static Integer currentMaxRequests;
   private static Integer currentMaxRequestsPerHost;
   private static final int MAX_PUT_BYTES = 2 * 1024 * 1024;
+
+  /**
+   * Freshness advertised for ExpTech tiles.
+   *
+   * <p>Their URLs are content-addressed — a new radar frame is a new path — so a body can never go
+   * stale under its own URL. Saying so lets MapLibre's own ambient database answer repeat requests
+   * without issuing a call at all. Without this header MapLibre treats every tile as already
+   * expired and re-requests it on every reveal, which is what made a timeline scrub generate
+   * traffic for tiles it had just drawn.
+   */
+  private static final String TILE_CACHE_CONTROL = "public, max-age=604800, immutable";
+
   private static volatile OkHttpClient client;
 
   public static void install() {
@@ -33,11 +47,35 @@ abstract class MapLibreHttpRequestUtil {
     }
   }
 
-  /** Drop every in-flight / queued OkHttp call (abandoned radar/sat frames). */
-  public static void cancelPendingFetches() {
+  /**
+   * Drops in-flight / queued OkHttp calls whose URL contains one of {@code needles}; a null or
+   * empty list drops everything.
+   *
+   * <p>Scoping matters: a timeline scrub abandons the frames it swept past, but the basemap and the
+   * frame the finger landed on must keep loading — cancelling those too is what made a settle look
+   * like a stall.
+   */
+  public static void cancelPendingFetches(@Nullable List<String> needles) {
     OkHttpClient c = client;
     if (c == null) return;
-    c.dispatcher().cancelAll();
+    if (needles == null || needles.isEmpty()) {
+      c.dispatcher().cancelAll();
+      return;
+    }
+    cancelMatching(c.dispatcher().queuedCalls(), needles);
+    cancelMatching(c.dispatcher().runningCalls(), needles);
+  }
+
+  private static void cancelMatching(List<Call> calls, List<String> needles) {
+    for (Call call : calls) {
+      String url = call.request().url().toString();
+      for (String needle : needles) {
+        if (needle != null && url.contains(needle)) {
+          call.cancel();
+          break;
+        }
+      }
+    }
   }
 
   public static void setHttpHeaders(Map<String, String> headers, MethodChannel.Result result) {
@@ -140,7 +178,8 @@ abstract class MapLibreHttpRequestUtil {
               .header(
                   "Content-Type",
                   hit.contentType != null ? hit.contentType : "application/octet-stream")
-              .header("Content-Length", String.valueOf(hit.data.length));
+              .header("Content-Length", String.valueOf(hit.data.length))
+              .header("Cache-Control", TILE_CACHE_CONTROL);
       if (hit.etag != null) {
         rb.header("ETag", hit.etag);
       }
@@ -178,18 +217,23 @@ abstract class MapLibreHttpRequestUtil {
     }
 
     Response response = chain.proceed(reqBuilder.build());
-    if (MapLibreDartTileBridge.isTileUrl(url)
-        && (response.code() == 200 || response.code() == 404)
-        && response.body() != null) {
+    if (!MapLibreDartTileBridge.isTileUrl(url)) return response;
+
+    // Origins that already state their own freshness are left alone.
+    Response.Builder rebuilt = response.newBuilder();
+    if (response.header("Cache-Control") == null) {
+      rebuilt.header("Cache-Control", TILE_CACHE_CONTROL);
+    }
+    if ((response.code() == 200 || response.code() == 404) && response.body() != null) {
       ResponseBody body = response.body();
       long contentLength = body.contentLength();
       if (contentLength >= 0 && contentLength <= MAX_PUT_BYTES) {
         byte[] bytes = body.bytes();
-        MapLibreDartTileBridge.putAsync(
+        MapLibreDartTileBridge.put(
             url, bytes, response.header("Content-Type"), response.header("ETag"));
-        return response.newBuilder().body(ResponseBody.create(bytes, body.contentType())).build();
+        rebuilt.body(ResponseBody.create(bytes, body.contentType()));
       }
     }
-    return response;
+    return rebuilt.build();
   }
 }

@@ -1,16 +1,32 @@
 import Foundation
 
-// URLProtocol that:
-// 1. Serves ExpTech tiles from Dart SQLite when present
-// 2. On miss, fetches once via a shared URLSession and puts the body into Dart
-// 3. Injects custom headers on all live requests (tiles / style / glyphs / …)
-//
-// Forwarding uses ONE shared ephemeral URLSession with `protocolClasses = []`
-// (no recursion, no per-request session). AmbientPrefetch is off — MapLibre is
-// the sole tile network path, so there is no Dio+native double fetch.
+/// URLProtocol that:
+/// 1. Serves ExpTech tiles out of the Dart-owned cache when present
+/// 2. On a miss, fetches once through a shared URLSession and reports the body
+///    back to Dart so it lands in SQLite
+/// 3. Injects custom headers on all live requests (tiles / style / glyphs / …)
+///
+/// Forwarding uses ONE shared ephemeral URLSession with `protocolClasses = []`
+/// (no recursion, no per-request session).
+///
+/// **Nothing here blocks.** A cache lookup that has to reach Dart returns
+/// through a callback, so a URL-loading thread is never parked — that parking
+/// was what turned a timeline scrub into a request storm: the lookup timed out,
+/// the timeout read as a miss, and MapLibre re-downloaded tiles that were
+/// already on disk.
 final class MapLibreHeadersProtocol: URLProtocol {
     private static let handledKey = "MapLibreHeadersProtocolHandled"
     private static let maxPutBytes = 2 * 1024 * 1024
+
+    /// Freshness advertised for ExpTech tiles.
+    ///
+    /// Their URLs are content-addressed — a new radar frame is a new path — so
+    /// a body can never go stale under its own URL. Saying so lets MapLibre's
+    /// own ambient database answer repeat requests without entering the URL
+    /// loading system at all. Without this header MapLibre treats every tile as
+    /// already expired and re-requests it on every reveal, which is what made a
+    /// timeline scrub generate traffic for tiles it had just drawn.
+    private static let tileCacheControl = "public, max-age=604800, immutable"
 
     /// Shared forwarder — never invalidate; cancel tasks only.
     private static let forwardSession: URLSession = {
@@ -18,29 +34,51 @@ final class MapLibreHeadersProtocol: URLProtocol {
         config.protocolClasses = []
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.urlCache = nil
-        // Scrub storms: fail fast instead of holding 30s slots for abandoned frames.
+        // Scrub storms: fail fast instead of holding 30 s slots for abandoned frames.
         config.timeoutIntervalForRequest = 8
         config.timeoutIntervalForResource = 12
         config.httpMaximumConnectionsPerHost = 16
         return URLSession(configuration: config)
     }()
 
-    /// Drop every in-flight forward (abandoned radar/sat frames after scrub).
-    /// Blocks until the cancel list is applied so the next fetch cannot race.
-    static func cancelAllForwardTasks() {
-        let sem = DispatchSemaphore(value: 0)
+    /// Cancels in-flight forwards whose URL contains one of [needles]; an empty
+    /// list cancels everything.
+    ///
+    /// Scoping matters: a scrub abandons the frames it swept past, but the
+    /// basemap and the frame the finger landed on must keep loading. [completion]
+    /// runs once the cancels have been applied, so a caller can await that
+    /// without any thread blocking to provide the guarantee.
+    static func cancelForwardTasks(
+        matching needles: [String],
+        completion: (() -> Void)? = nil
+    ) {
         forwardSession.getAllTasks { tasks in
             for task in tasks {
-                task.cancel()
+                guard !needles.isEmpty else {
+                    task.cancel()
+                    continue
+                }
+                let url = task.originalRequest?.url?.absoluteString
+                    ?? task.currentRequest?.url?.absoluteString
+                    ?? ""
+                if needles.contains(where: { url.contains($0) }) {
+                    task.cancel()
+                }
             }
-            sem.signal()
+            completion?()
         }
-        _ = sem.wait(timeout: .now() + 0.5)
     }
 
+    private let stateLock = NSLock()
     private var activeTask: URLSessionDataTask?
     private var stopped = false
     private var forwardingTile = false
+
+    private var isStopped: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopped
+    }
 
     override class func canInit(with request: URLRequest) -> Bool {
         guard URLProtocol.property(forKey: handledKey, in: request) == nil else {
@@ -56,34 +94,78 @@ final class MapLibreHeadersProtocol: URLProtocol {
 
     override func startLoading() {
         let urlString = request.url?.absoluteString ?? ""
-
-        // ExpTech tile hit → Dart only (no network).
-        if MapLibreDartTileBridge.isTileUrl(urlString) {
-            if let hit = MapLibreDartTileBridge.get(url: urlString), let url = request.url {
-                guard !stopped else { return }
-                var headers: [String: String] = [
-                    "Content-Type": hit.contentType ?? "application/octet-stream",
-                    "Content-Length": "\(hit.data.count)",
-                ]
-                if let etag = hit.etag {
-                    headers["ETag"] = etag
-                }
-                let response = HTTPURLResponse(
-                    url: url,
-                    statusCode: 200,
-                    httpVersion: "HTTP/1.1",
-                    headerFields: headers
-                )!
-                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                client?.urlProtocol(self, didLoad: hit.data)
-                client?.urlProtocolDidFinishLoading(self)
-                return
-            }
-            // stopLoading may have fired while get() blocked — don't start a fetch.
-            guard !stopped else { return }
+        guard MapLibreDartTileBridge.isTileUrl(urlString) else {
+            forward()
+            return
         }
+        forwardingTile = true
 
-        forwardingTile = MapLibreDartTileBridge.isTileUrl(urlString)
+        // Session-hot tiles resolve with no IPC at all.
+        if let hit = MapLibreDartTileBridge.cached(url: urlString) {
+            serve(hit)
+            return
+        }
+        MapLibreDartTileBridge.lookup(url: urlString) { [weak self] hit in
+            guard let self, !self.isStopped else { return }
+            if let hit {
+                self.serve(hit)
+            } else {
+                self.forward()
+            }
+        }
+    }
+
+    override func stopLoading() {
+        stateLock.lock()
+        stopped = true
+        let task = activeTask
+        activeTask = nil
+        stateLock.unlock()
+        task?.cancel()
+    }
+
+    /// Restamps a live tile response with [tileCacheControl] so MapLibre keeps
+    /// it. Origins that already say something about freshness are left alone.
+    private static func withTileFreshness(_ response: URLResponse) -> URLResponse {
+        guard let http = response as? HTTPURLResponse,
+              let url = http.url,
+              http.value(forHTTPHeaderField: "Cache-Control") == nil
+        else { return response }
+        var headers = http.allHeaderFields as? [String: String] ?? [:]
+        headers["Cache-Control"] = tileCacheControl
+        return HTTPURLResponse(
+            url: url,
+            statusCode: http.statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: headers
+        ) ?? response
+    }
+
+    /// Replays a cached body as a synthetic 200 — no network.
+    private func serve(_ hit: MapLibreTileEntry) {
+        guard !isStopped, let url = request.url else { return }
+        var headers: [String: String] = [
+            "Content-Type": hit.contentType ?? "application/octet-stream",
+            "Content-Length": "\(hit.data.count)",
+            "Cache-Control": Self.tileCacheControl,
+        ]
+        if let etag = hit.etag {
+            headers["ETag"] = etag
+        }
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: headers
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: hit.data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    /// Sends the request upstream with custom headers applied.
+    private func forward() {
+        guard !isStopped else { return }
 
         let mutable = (request as NSURLRequest).mutableCopy() as! NSMutableURLRequest
         URLProtocol.setProperty(true, forKey: Self.handledKey, in: mutable)
@@ -97,29 +179,27 @@ final class MapLibreHeadersProtocol: URLProtocol {
             }
         }
 
-        guard !stopped else { return }
         let task = Self.forwardSession.dataTask(with: mutable as URLRequest) {
             [weak self] data, response, error in
             self?.finishForward(data: data, response: response, error: error)
         }
-        activeTask = task
+
+        stateLock.lock()
         if stopped {
+            stateLock.unlock()
             task.cancel()
-            activeTask = nil
             return
         }
+        activeTask = task
+        stateLock.unlock()
         task.resume()
     }
 
-    override func stopLoading() {
-        stopped = true
-        activeTask?.cancel()
-        activeTask = nil
-    }
-
     private func finishForward(data: Data?, response: URLResponse?, error: Error?) {
-        guard !stopped else { return }
+        guard !isStopped else { return }
+        stateLock.lock()
         activeTask = nil
+        stateLock.unlock()
 
         if let error {
             if (error as NSError).code == NSURLErrorCancelled { return }
@@ -149,20 +229,24 @@ final class MapLibreHeadersProtocol: URLProtocol {
             return
         }
 
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(
+            self,
+            didReceive: forwardingTile ? Self.withTileFreshness(response) : response,
+            cacheStoragePolicy: .notAllowed
+        )
         if !body.isEmpty {
             client?.urlProtocol(self, didLoad: body)
         }
 
         if forwardingTile,
            let http = response as? HTTPURLResponse,
-           (http.statusCode == 200 || http.statusCode == 404),
+           http.statusCode == 200 || http.statusCode == 404,
            !body.isEmpty || http.statusCode == 404,
            body.count <= Self.maxPutBytes,
            let url = http.url?.absoluteString ?? request.url?.absoluteString
         {
             // 200 body or basemap-style 404 hole — both land in Dart SQLite.
-            MapLibreDartTileBridge.putAsync(
+            MapLibreDartTileBridge.put(
                 url: url,
                 data: body,
                 contentType: http.value(forHTTPHeaderField: "Content-Type"),
