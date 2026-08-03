@@ -6,7 +6,7 @@ import Foundation
 enum MapLibreDartTileBridge {
     private static let lock = NSLock()
     private static var channel: FlutterMethodChannel?
-    private static let getTimeout: TimeInterval = 0.5
+    private static let getTimeout: TimeInterval = 0.1
 
     static func attach(messenger: FlutterBinaryMessenger) {
         let ch = FlutterMethodChannel(

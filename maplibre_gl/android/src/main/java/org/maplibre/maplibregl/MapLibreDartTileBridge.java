@@ -31,7 +31,7 @@ final class MapLibreDartTileBridge {
   private static final Object lock = new Object();
   private static MethodChannel channel;
   private static final Handler main = new Handler(Looper.getMainLooper());
-  private static final long GET_TIMEOUT_MS = 500;
+  private static final long GET_TIMEOUT_MS = 100;
 
   private MapLibreDartTileBridge() {}
 

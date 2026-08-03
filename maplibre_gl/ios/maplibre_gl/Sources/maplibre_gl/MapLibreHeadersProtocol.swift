@@ -18,7 +18,10 @@ final class MapLibreHeadersProtocol: URLProtocol {
         config.protocolClasses = []
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.urlCache = nil
-        config.timeoutIntervalForRequest = 30
+        // Scrub storms: fail fast instead of holding 30s slots for abandoned frames.
+        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForResource = 12
+        config.httpMaximumConnectionsPerHost = 8
         return URLSession(configuration: config)
     }()
 
@@ -42,27 +45,29 @@ final class MapLibreHeadersProtocol: URLProtocol {
         let urlString = request.url?.absoluteString ?? ""
 
         // ExpTech tile hit → Dart only (no network).
-        if MapLibreDartTileBridge.isTileUrl(urlString),
-           let hit = MapLibreDartTileBridge.get(url: urlString),
-           let url = request.url
-        {
-            var headers: [String: String] = [
-                "Content-Type": hit.contentType ?? "application/octet-stream",
-                "Content-Length": "\(hit.data.count)",
-            ]
-            if let etag = hit.etag {
-                headers["ETag"] = etag
+        if MapLibreDartTileBridge.isTileUrl(urlString) {
+            if let hit = MapLibreDartTileBridge.get(url: urlString), let url = request.url {
+                guard !stopped else { return }
+                var headers: [String: String] = [
+                    "Content-Type": hit.contentType ?? "application/octet-stream",
+                    "Content-Length": "\(hit.data.count)",
+                ]
+                if let etag = hit.etag {
+                    headers["ETag"] = etag
+                }
+                let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: headers
+                )!
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: hit.data)
+                client?.urlProtocolDidFinishLoading(self)
+                return
             }
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 200,
-                httpVersion: "HTTP/1.1",
-                headerFields: headers
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: hit.data)
-            client?.urlProtocolDidFinishLoading(self)
-            return
+            // stopLoading may have fired while get() blocked — don't start a fetch.
+            guard !stopped else { return }
         }
 
         forwardingTile = MapLibreDartTileBridge.isTileUrl(urlString)
@@ -79,11 +84,17 @@ final class MapLibreHeadersProtocol: URLProtocol {
             }
         }
 
+        guard !stopped else { return }
         let task = Self.forwardSession.dataTask(with: mutable as URLRequest) {
             [weak self] data, response, error in
             self?.finishForward(data: data, response: response, error: error)
         }
         activeTask = task
+        if stopped {
+            task.cancel()
+            activeTask = nil
+            return
+        }
         task.resume()
     }
 

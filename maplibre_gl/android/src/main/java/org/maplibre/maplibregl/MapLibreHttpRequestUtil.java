@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
+import java.util.concurrent.TimeUnit;
 import okhttp3.Dispatcher;
 import okhttp3.Interceptor;
 import okhttp3.MediaType;
@@ -85,18 +86,19 @@ abstract class MapLibreHttpRequestUtil {
   }
 
   private static void rebuildClient() {
-    OkHttpClient.Builder builder = new OkHttpClient.Builder();
+    OkHttpClient.Builder builder =
+        new OkHttpClient.Builder()
+            // Scrub storms: fail fast instead of holding 30s slots for abandoned frames.
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(12, TimeUnit.SECONDS);
 
-    if (currentMaxRequests != null || currentMaxRequestsPerHost != null) {
-      Dispatcher dispatcher = new Dispatcher();
-      if (currentMaxRequests != null) {
-        dispatcher.setMaxRequests(currentMaxRequests);
-      }
-      if (currentMaxRequestsPerHost != null) {
-        dispatcher.setMaxRequestsPerHost(currentMaxRequestsPerHost);
-      }
-      builder.dispatcher(dispatcher);
-    }
+    Dispatcher dispatcher = new Dispatcher();
+    dispatcher.setMaxRequests(currentMaxRequests != null ? currentMaxRequests : 32);
+    dispatcher.setMaxRequestsPerHost(
+        currentMaxRequestsPerHost != null ? currentMaxRequestsPerHost : 8);
+    builder.dispatcher(dispatcher);
 
     // App interceptor: Dart hit short-circuits. Network interceptor: headers + put.
     builder.addInterceptor(MapLibreHttpRequestUtil::serveFromDart);
