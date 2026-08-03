@@ -136,6 +136,19 @@ final class MapLibreHeadersProtocol: URLProtocol {
         }
 
         let body = data ?? Data()
+        // Empty 200s make ImageIO probe garbage ("GIF" decode errors); treat as fail.
+        if forwardingTile,
+           let http = response as? HTTPURLResponse,
+           http.statusCode == 200,
+           body.isEmpty
+        {
+            client?.urlProtocol(
+                self,
+                didFailWithError: URLError(.zeroByteResource)
+            )
+            return
+        }
+
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         if !body.isEmpty {
             client?.urlProtocol(self, didLoad: body)
@@ -144,6 +157,7 @@ final class MapLibreHeadersProtocol: URLProtocol {
         if forwardingTile,
            let http = response as? HTTPURLResponse,
            (http.statusCode == 200 || http.statusCode == 404),
+           !body.isEmpty || http.statusCode == 404,
            body.count <= Self.maxPutBytes,
            let url = http.url?.absoluteString ?? request.url?.absoluteString
         {
