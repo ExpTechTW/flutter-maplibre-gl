@@ -243,11 +243,19 @@ final class MapLibreHeadersProtocol: URLProtocol {
         }
 
         let body = data ?? Data()
-        // Empty 200s make ImageIO probe garbage ("GIF" decode errors); treat as fail.
+        // Empty 200s make ImageIO probe garbage ("GIF" decode errors), so a
+        // zero-byte *raster* tile is reported as a failure rather than decoded.
+        //
+        // Scoped to images on purpose: a vector tile with no features in it is a
+        // legitimate empty 200, and failing those would put holes in a layer that
+        // is simply sparse (AED coverage, say) rather than broken.
         if forwardingTile,
            let http = response as? HTTPURLResponse,
            http.statusCode == 200,
-           body.isEmpty
+           body.isEmpty,
+           (http.value(forHTTPHeaderField: "Content-Type") ?? "")
+               .lowercased()
+               .hasPrefix("image/")
         {
             client?.urlProtocol(
                 self,

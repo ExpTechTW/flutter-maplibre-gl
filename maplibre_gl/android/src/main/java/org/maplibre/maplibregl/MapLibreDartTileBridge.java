@@ -218,6 +218,38 @@ final class MapLibreDartTileBridge {
     synchronized (channelLock) {
       channel = ch;
     }
+
+    // Pull what Dart wants cached, rather than waiting to be told.
+    //
+    // Dart binds the cache during app bootstrap — long before the first map
+    // widget, and therefore before this plugin is registered — so its push lands
+    // on a channel that does not exist yet and is silently lost. The symptom is
+    // not a slow cache but a dead one: no URL matches, so nothing is served from
+    // or written to Dart at all.
+    main.post(
+        () ->
+            ch.invokeMethod(
+                "cacheablePatterns",
+                null,
+                new MethodChannel.Result() {
+                  @Override
+                  public void success(@Nullable Object result) {
+                    if (!(result instanceof List)) return;
+                    final List<String> patterns = new ArrayList<>();
+                    for (Object item : (List<?>) result) {
+                      if (item instanceof String) patterns.add((String) item);
+                    }
+                    synchronized (patternLock) {
+                      cacheablePatterns = patterns;
+                    }
+                  }
+
+                  @Override
+                  public void error(String code, String msg, Object details) {}
+
+                  @Override
+                  public void notImplemented() {}
+                }));
   }
 
   @Nullable

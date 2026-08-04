@@ -220,6 +220,22 @@ enum MapLibreDartTileBridge {
         channelLock.lock()
         channel = ch
         channelLock.unlock()
+
+        // Pull what Dart wants cached, rather than waiting to be told.
+        //
+        // Dart binds the cache during app bootstrap — long before the first map
+        // widget, and therefore before this plugin is registered — so its push
+        // lands on a channel that does not exist yet and is silently lost. The
+        // symptom is not a slow cache but a **dead** one: no URL matches, so
+        // nothing is served from or written to Dart at all.
+        DispatchQueue.main.async {
+            ch.invokeMethod("cacheablePatterns", arguments: nil) { result in
+                guard let patterns = result as? [String] else { return }
+                patternLock.lock()
+                cacheablePatterns = patterns
+                patternLock.unlock()
+            }
+        }
     }
 
     private static var activeChannel: FlutterMethodChannel? {

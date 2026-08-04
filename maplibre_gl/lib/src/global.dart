@@ -120,11 +120,18 @@ typedef MapLibreTileCachePutBatch =
 /// thread waiting on Flutter — persistence, eviction policy, and
 /// traffic metering all stay in Dart.
 Future<void> bindMapLibreTileCache({
+  required List<String> cacheablePatterns,
   required MapLibreTileCacheGetBatch getBatch,
   required MapLibreTileCachePutBatch putBatch,
 }) async {
   _tileCacheChannel.setMethodCallHandler((call) async {
     switch (call.method) {
+      // Native **pulls** this when it attaches. Binding usually happens during
+      // app bootstrap, long before the first map exists and therefore before
+      // this plugin is registered, so a push alone can land on a channel with
+      // no handler and be lost — leaving native caching nothing, silently.
+      case 'cacheablePatterns':
+        return cacheablePatterns;
       case 'getBatch':
         final args = Map<String, Object?>.from(call.arguments as Map);
         final urls = (args['urls'] as List).cast<String>();
@@ -149,6 +156,9 @@ Future<void> bindMapLibreTileCache({
         throw MissingPluginException(call.method);
     }
   });
+  // Fast path when the plugin is already attached; the pull above is what makes
+  // the ordering irrelevant.
+  await _setCacheablePatterns(cacheablePatterns);
 }
 
 MapLibreTile? _tileFromWire(Object? entry) {
@@ -206,13 +216,12 @@ Future<List<String>> mapLibreTilesMissing(List<String> urls) async {
   }
 }
 
-/// Declares which URLs Dart owns the caching of, as plain substrings.
+/// Pushes the cacheable-URL substrings to native.
 ///
-/// Until this is set the native intercept caches **nothing** — it will not
-/// guess at URL shapes the Dart handlers may not actually store, because a
-/// guess that Dart disagrees with becomes a URL native asks about forever and
-/// never gets an answer for.
-Future<void> setMapLibreCacheablePatterns(List<String> patterns) async {
+/// Private on purpose: patterns are declared once, through
+/// [bindMapLibreTileCache], so a caller cannot bind handlers and then forget to
+/// say what they cover.
+Future<void> _setCacheablePatterns(List<String> patterns) async {
   try {
     await _tileCacheChannel.invokeMethod<void>('setCacheablePatterns', {
       'patterns': patterns,
