@@ -1368,7 +1368,20 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         }
     }
 
+    /**
+     Shared look for the user-location puck, chosen so iOS and Android read the same.
+     Keep in sync with `LOCATION_TINT_COLOR` in MapLibreMapController.java.
+
+     On iOS the dot, its accuracy ring and the bearing arrow are all drawn in the map
+     view's `tintColor`; only the pulsing halo takes its colour from the annotation
+     view style (see `mapView(styleForDefaultUserLocationAnnotationView:)` below).
+     */
+    private static let userLocationTintColor = UIColor(
+        red: 0x1A / 255.0, green: 0x73 / 255.0, blue: 0xE8 / 255.0, alpha: 1
+    )
+
     private func updateMyLocationEnabled() {
+        mapView.tintColor = MapLibreMapController.userLocationTintColor
         mapView.showsUserLocation = myLocationEnabled
     }
 
@@ -1597,6 +1610,24 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     // handle missing images
     func mapView(_: MLNMapView, didFailToLoadImage name: String) -> UIImage? {
         return loadIconImage(name: name)
+    }
+
+    /**
+     Colours the built-in user-location view.
+
+     Without this the halo falls back to the platform default, which does not match the
+     tint Android is configured with. The halo itself (a 3 s looping pulse, hidden once
+     horizontal accuracy is worse than 10 m) is baked into
+     `MLNFaux3DUserLocationAnnotationView` and cannot be disabled or retimed.
+     */
+    func mapView(
+        styleForDefaultUserLocationAnnotationView _: MLNMapView
+    ) -> MLNUserLocationAnnotationViewStyle {
+        let style = MLNUserLocationAnnotationViewStyle()
+        style.puckFillColor = MapLibreMapController.userLocationTintColor
+        style.puckArrowFillColor = MapLibreMapController.userLocationTintColor
+        style.haloFillColor = MapLibreMapController.userLocationTintColor
+        return style
     }
 
     func mapView(_: MLNMapView, didUpdate userLocation: MLNUserLocation?) {

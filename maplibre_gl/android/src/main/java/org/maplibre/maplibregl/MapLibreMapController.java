@@ -391,10 +391,39 @@ final class MapLibreMapController
     return lastLayerId != null && !lastLayerId.equals("mapbox-location-bearing-layer");
   }
 
+  /**
+   * Shared look for the user-location puck, chosen so Android and iOS read the same.
+   *
+   * <p>iOS hard-codes a 3 s looping halo pulse that hides itself once the fix is worse than 10 m,
+   * and a 10 %-opacity accuracy ring; these mirror that. The tint is applied to the dot, the
+   * bearing arrow, the accuracy ring and the pulse so a single colour drives all four.
+   */
+  private static final int LOCATION_TINT_COLOR = 0xFF1A73E8;
+
+  private static final float LOCATION_PULSE_DURATION_MS = 3000f;
+  private static final float LOCATION_PULSE_MAX_RADIUS_DP = 35f;
+  private static final float LOCATION_PULSE_ALPHA = 0.4f;
+  private static final float LOCATION_ACCURACY_ALPHA = 0.1f;
+
   private LocationComponentOptions buildLocationComponentOptions(Style style) {
     final LocationComponentOptions.Builder optionsBuilder =
         LocationComponentOptions.builder(context);
     optionsBuilder.trackingGesturesManagement(true);
+
+    // Match iOS's built-in user-location view (MLNFaux3DUserLocationAnnotationView),
+    // which bakes in a looping halo pulse over a faint static accuracy ring and
+    // offers no way to turn either off. Android draws neither unless asked, so
+    // without this the same app looks materially different on the two platforms.
+    // Keep in sync with `userLocationTintColor` in MapLibreMapController.swift.
+    optionsBuilder.pulseEnabled(true);
+    optionsBuilder.pulseSingleDuration(LOCATION_PULSE_DURATION_MS);
+    optionsBuilder.pulseMaxRadius(LOCATION_PULSE_MAX_RADIUS_DP);
+    optionsBuilder.pulseColor(LOCATION_TINT_COLOR);
+    optionsBuilder.pulseAlpha(LOCATION_PULSE_ALPHA);
+    optionsBuilder.accuracyColor(LOCATION_TINT_COLOR);
+    optionsBuilder.accuracyAlpha(LOCATION_ACCURACY_ALPHA);
+    optionsBuilder.foregroundTintColor(LOCATION_TINT_COLOR);
+    optionsBuilder.bearingTintColor(LOCATION_TINT_COLOR);
 
     final String lastLayerId = getLastLayerOnStyle(style);
     if (lastLayerId != null) {
