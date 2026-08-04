@@ -27,6 +27,7 @@ import android.view.View;
 import android.widget.FrameLayout;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.lifecycle.DefaultLifecycleObserver;
 import androidx.lifecycle.Lifecycle;
 import androidx.lifecycle.LifecycleOwner;
@@ -69,6 +70,7 @@ import org.maplibre.android.style.layers.FillLayer;
 import org.maplibre.android.style.layers.HeatmapLayer;
 import org.maplibre.android.style.layers.HillshadeLayer;
 import org.maplibre.android.style.layers.Layer;
+import org.maplibre.android.style.layers.TransitionOptions;
 import org.maplibre.android.style.layers.LineLayer;
 import org.maplibre.android.style.layers.Property;
 import org.maplibre.android.style.layers.PropertyFactory;
@@ -338,6 +340,21 @@ final class MapLibreMapController
       locationComponent.addOnCameraTrackingChangedListener(this);
     } else {
       Log.e(TAG, "missing location permissions");
+    }
+  }
+
+  /**
+   * Applies a {@code raster-opacity-transition} from a properties map, if it carries one.
+   *
+   * <p>Transitions live on the layer rather than in its {@code PropertyValue}s, so they cannot ride
+   * along with the converted properties and are applied here instead.
+   */
+  private void applyRasterOpacityTransition(@Nullable Layer layer, @Nullable Object properties) {
+    if (!(layer instanceof RasterLayer) || properties == null) return;
+    final TransitionOptions transition =
+        LayerPropertyConverter.rasterOpacityTransition(properties);
+    if (transition != null) {
+      ((RasterLayer) layer).setRasterOpacityTransition(transition);
     }
   }
 
@@ -1418,6 +1435,7 @@ final class MapLibreMapController
               return;
             }
             layer.setProperties(properties);
+            applyRasterOpacityTransition(layer, call.argument("properties"));
             result.success(null);
           } else {
             result.error("LAYER_NOT_FOUND_ERROR", "Layer " + layerId + "not found", null);
@@ -1545,6 +1563,7 @@ final class MapLibreMapController
             result.error("STYLE_NOT_READY", "Style is null or not fully loaded. Has onStyleLoaded() already been invoked?", null);
             break;
           }
+          applyRasterOpacityTransition(style.getLayer(layerId), call.argument("properties"));
           updateLocationComponentLayer();
 
           result.success(null);

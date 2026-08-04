@@ -3,9 +3,11 @@
 
 package org.maplibre.maplibregl;
 
+import androidx.annotation.Nullable;
 import org.maplibre.android.style.expressions.Expression;
 import org.maplibre.android.style.layers.PropertyFactory;
 import org.maplibre.android.style.layers.PropertyValue;
+import org.maplibre.android.style.layers.TransitionOptions;
 
 import java.util.LinkedList;
 import java.util.List;
@@ -543,6 +545,27 @@ class LayerPropertyConverter {
     }
 
     return properties.toArray(new PropertyValue[properties.size()]);
+  }
+
+  /**
+   * Reads {@code raster-opacity-transition} out of a properties map.
+   *
+   * <p>Transitions are style-spec objects ({@code {duration, delay}} in milliseconds), not
+   * {@code PropertyValue}s — they are set on the layer itself, so they cannot ride along with
+   * {@link #interpretRasterLayerProperties}. Returns null when the map does not carry one.
+   */
+  @Nullable
+  static TransitionOptions rasterOpacityTransition(Object o) {
+    final Map<String, Object> data = (Map<String, Object>) toMap(o);
+    if (data == null) return null;
+    final Object raw = data.get("raster-opacity-transition");
+    if (!(raw instanceof Map)) return null;
+    final Map<?, ?> spec = (Map<?, ?>) raw;
+    final Object duration = spec.get("duration");
+    final Object delay = spec.get("delay");
+    return new TransitionOptions(
+        duration instanceof Number ? ((Number) duration).longValue() : 0,
+        delay instanceof Number ? ((Number) delay).longValue() : 0);
   }
 
   static PropertyValue[] interpretRasterLayerProperties(Object o) {

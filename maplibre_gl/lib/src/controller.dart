@@ -683,13 +683,25 @@ class MapLibreMapController extends ChangeNotifier {
   /// platform side.
   ///
   /// NOTE: The [properties] will not skip null values, so setting a property to null will potentially reset it to default.
+  /// Applies [properties] to the layer [layerId].
+  ///
+  /// By default an unset field is sent as an explicit null and **clears** that
+  /// property back to its style default, so one call fully describes the
+  /// layer's paint. Pass [skipNulls] to send only the fields that were set
+  /// instead, leaving every other property untouched.
+  ///
+  /// Prefer `skipNulls: true` on a hot path. The full form ships every property
+  /// of the layer type on every call and makes the platform side assign each
+  /// one — for something driven per input frame (scrubbing a raster timeline)
+  /// that is almost entirely writes of values that did not change.
   Future<void> setLayerProperties(
     String layerId,
-    LayerProperties properties,
-  ) async {
+    LayerProperties properties, {
+    bool skipNulls = false,
+  }) async {
     await _maplibrePlatform.setLayerProperties(
       layerId,
-      properties.toJson(skipNulls: false),
+      properties.toJson(skipNulls: skipNulls),
     );
   }
 

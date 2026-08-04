@@ -6,6 +6,7 @@ import androidx.annotation.Nullable;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodChannel;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -56,9 +57,11 @@ final class MapLibreDartTileBridge {
   private static final long GET_TIMEOUT_MS = 2500;
   private static final long PUT_WINDOW_MS = 250;
   private static final int MAX_PUT_BATCH = 32;
-  private static final int DEFAULT_MEMORY_LIMIT = 64 * 1024 * 1024;
+  private static final int DEFAULT_MEMORY_LIMIT = 2 * 1024 * 1024;
 
   private static final Object channelLock = new Object();
+  private static final Object patternLock = new Object();
+  private static List<String> cacheablePatterns = Collections.emptyList();
   private static MethodChannel channel;
   private static final Handler main = new Handler(Looper.getMainLooper());
 
@@ -183,6 +186,16 @@ final class MapLibreDartTileBridge {
                 result.success(missing);
                 return;
               }
+            case "setCacheablePatterns":
+              {
+                final List<String> patterns = call.argument("patterns");
+                synchronized (patternLock) {
+                  cacheablePatterns =
+                      patterns != null ? new ArrayList<>(patterns) : Collections.emptyList();
+                }
+                result.success(null);
+                return;
+              }
             case "evictTiles":
               mem.evict(call.argument("contains"));
               result.success(null);
@@ -214,11 +227,23 @@ final class MapLibreDartTileBridge {
     }
   }
 
-  /** ExpTech immutable tiles only — not glyphs / other {@code *.pbf}. */
-  static boolean isTileUrl(String url) {
+  /**
+   * Whether {@code url} is one Dart wants to own the caching of.
+   *
+   * <p>Nothing matches until Dart configures the patterns, which is deliberate: an unconfigured
+   * bridge caches nothing rather than guessing at URL shapes the Dart side may not actually store.
+   * Guessing is how the two ends drift into a URL native keeps asking about and Dart never has.
+   */
+  static boolean isCacheableUrl(String url) {
     if (url == null) return false;
-    if (url.contains("/api/v1/map/tiles/")) return true;
-    return url.contains("/api/v2/tiles/");
+    final List<String> patterns;
+    synchronized (patternLock) {
+      patterns = cacheablePatterns;
+    }
+    for (String pattern : patterns) {
+      if (pattern != null && url.contains(pattern)) return true;
+    }
+    return false;
   }
 
   /**
@@ -229,7 +254,7 @@ final class MapLibreDartTileBridge {
    */
   @Nullable
   static Entry get(String url) {
-    if (!isTileUrl(url)) return null;
+    if (!isCacheableUrl(url)) return null;
     Entry hit = mem.get(url);
     if (hit != null) return hit;
     if (activeChannel() == null) return null;
@@ -321,7 +346,7 @@ final class MapLibreDartTileBridge {
   /** Records a network-fetched tile: memory now, Dart on the next batch flush. */
   static void put(
       String url, byte[] data, @Nullable String contentType, @Nullable String etag) {
-    if (!isTileUrl(url) || data == null) return;
+    if (!isCacheableUrl(url) || data == null) return;
     mem.put(url, new Entry(data, contentType, etag));
     if (activeChannel() == null) return;
 

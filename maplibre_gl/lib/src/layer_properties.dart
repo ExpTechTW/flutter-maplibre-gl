@@ -2050,8 +2050,17 @@ class RasterLayerProperties implements LayerProperties {
   ///   basic functionality with js, android, ios, macos
   final dynamic visibility;
 
+  /// The transition applied to changes of `rasterOpacity`, as the style-spec
+  /// object `{'duration': ms, 'delay': ms}`.
+  ///
+  /// Unset means the spec default — a **300 ms** cross-fade. Pass a zero
+  /// duration when opacity is being driven frame by frame (scrubbing a raster
+  /// timeline), where an animated change reads as the map lagging the input.
+  final dynamic rasterOpacityTransition;
+
   const RasterLayerProperties({
     this.rasterOpacity,
+    this.rasterOpacityTransition,
     this.rasterHueRotate,
     this.rasterBrightnessMin,
     this.rasterBrightnessMax,
@@ -2086,6 +2095,7 @@ class RasterLayerProperties implements LayerProperties {
     }
 
     addIfPresent('raster-opacity', rasterOpacity);
+    addIfPresent('raster-opacity-transition', rasterOpacityTransition);
     addIfPresent('raster-hue-rotate', rasterHueRotate);
     addIfPresent('raster-brightness-min', rasterBrightnessMin);
     addIfPresent('raster-brightness-max', rasterBrightnessMax);
@@ -2100,6 +2110,7 @@ class RasterLayerProperties implements LayerProperties {
   factory RasterLayerProperties.fromJson(Map<String, dynamic> json) {
     return RasterLayerProperties(
       rasterOpacity: json['raster-opacity'],
+      rasterOpacityTransition: json['raster-opacity-transition'],
       rasterHueRotate: json['raster-hue-rotate'],
       rasterBrightnessMin: json['raster-brightness-min'],
       rasterBrightnessMax: json['raster-brightness-max'],

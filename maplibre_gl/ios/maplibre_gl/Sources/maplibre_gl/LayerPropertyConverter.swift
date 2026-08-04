@@ -337,8 +337,28 @@ class LayerPropertyConverter {
         }
     }
 
+    /// Reads a style-spec transition object (`{duration, delay}` in
+    /// milliseconds) into the seconds-based `MLNTransition`.
+    private class func transition(from value: Any) -> MLNTransition {
+        guard let spec = value as? [String: Any] else {
+            return MLNTransitionMake(0, 0)
+        }
+        let duration = (spec["duration"] as? NSNumber)?.doubleValue ?? 0
+        let delay = (spec["delay"] as? NSNumber)?.doubleValue ?? 0
+        return MLNTransitionMake(duration / 1000, delay / 1000)
+    }
+
     class func addRasterProperties(rasterLayer: MLNRasterStyleLayer, properties: [String: Any]) {
         for (propertyName, propertyValue) in properties {
+            // Transitions are spec objects, not expressions — handle them before
+            // interpretExpression, which would reject the dictionary and skip.
+            if propertyName == "raster-opacity-transition" {
+                if !(propertyValue is NSNull) {
+                    rasterLayer.rasterOpacityTransition = transition(from: propertyValue)
+                }
+                continue
+            }
+
             // Check if the value is explicitly null to clear the property
             var expression: NSExpression?
             if propertyValue is NSNull {

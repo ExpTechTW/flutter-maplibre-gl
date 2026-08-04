@@ -159,7 +159,7 @@ abstract class MapLibreHttpRequestUtil {
   private static Response serveFromDart(Interceptor.Chain chain) throws IOException {
     Request request = chain.request();
     String url = request.url().toString();
-    if (!MapLibreDartTileBridge.isTileUrl(url)) {
+    if (!MapLibreDartTileBridge.isCacheableUrl(url)) {
       return chain.proceed(request);
     }
 
@@ -217,7 +217,7 @@ abstract class MapLibreHttpRequestUtil {
     }
 
     Response response = chain.proceed(reqBuilder.build());
-    if (!MapLibreDartTileBridge.isTileUrl(url)) return response;
+    if (!MapLibreDartTileBridge.isCacheableUrl(url)) return response;
 
     // Origins that already state their own freshness are left alone.
     Response.Builder rebuilt = response.newBuilder();

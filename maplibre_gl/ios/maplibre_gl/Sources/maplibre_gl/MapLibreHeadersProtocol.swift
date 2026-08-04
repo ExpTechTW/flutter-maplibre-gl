@@ -94,7 +94,7 @@ final class MapLibreHeadersProtocol: URLProtocol {
 
     override func startLoading() {
         let urlString = request.url?.absoluteString ?? ""
-        guard MapLibreDartTileBridge.isTileUrl(urlString) else {
+        guard MapLibreDartTileBridge.isCacheableUrl(urlString) else {
             forward()
             return
         }

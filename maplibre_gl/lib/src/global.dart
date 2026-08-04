@@ -206,6 +206,22 @@ Future<List<String>> mapLibreTilesMissing(List<String> urls) async {
   }
 }
 
+/// Declares which URLs Dart owns the caching of, as plain substrings.
+///
+/// Until this is set the native intercept caches **nothing** — it will not
+/// guess at URL shapes the Dart handlers may not actually store, because a
+/// guess that Dart disagrees with becomes a URL native asks about forever and
+/// never gets an answer for.
+Future<void> setMapLibreCacheablePatterns(List<String> patterns) async {
+  try {
+    await _tileCacheChannel.invokeMethod<void>('setCacheablePatterns', {
+      'patterns': patterns,
+    });
+  } catch (_) {
+    // Plugin not attached / binding not ready (tests, early bootstrap).
+  }
+}
+
 /// Caps native's in-process tile mirror at [bytes] (LRU beyond that).
 ///
 /// This is a *memory* budget in front of the Dart store, unrelated to

@@ -142,7 +142,7 @@ enum MapLibreDartTileBridge {
     /// Fail a batch open rather than stranding tiles if the engine goes away.
     private static let batchTimeout: TimeInterval = 4
 
-    private static let defaultMemoryLimit = 64 * 1024 * 1024
+    private static let defaultMemoryLimit = 2 * 1024 * 1024
 
     // MARK: - State
 
@@ -191,6 +191,14 @@ enum MapLibreDartTileBridge {
                 mem.evict(matching: args?["contains"] as? [String] ?? [])
                 result(nil)
 
+            case "setCacheablePatterns":
+                let args = call.arguments as? [String: Any]
+                let patterns = args?["patterns"] as? [String] ?? []
+                patternLock.lock()
+                cacheablePatterns = patterns
+                patternLock.unlock()
+                result(nil)
+
             case "setMemoryLimit":
                 let args = call.arguments as? [String: Any]
                 mem.setLimit(args?["bytes"] as? Int ?? defaultMemoryLimit)
@@ -222,10 +230,23 @@ enum MapLibreDartTileBridge {
 
     // MARK: - URL classification
 
-    /// ExpTech immutable tiles only (basemap / radar / satellite / DPM).
-    static func isTileUrl(_ url: String) -> Bool {
-        if url.contains("/api/v1/map/tiles/") { return true }
-        if url.contains("/api/v2/tiles/") { return true }
+    /// URL fragments Dart wants to own the caching of.
+    ///
+    /// Empty until Dart configures it, which is deliberate: an unconfigured
+    /// bridge caches nothing rather than guessing at URL shapes the Dart side
+    /// may not actually store. Guessing is how the two ends drift into a URL
+    /// native keeps asking about and Dart never has.
+    private static let patternLock = NSLock()
+    private static var cacheablePatterns: [String] = []
+
+    /// Whether [url] is one Dart caches — see [cacheablePatterns].
+    static func isCacheableUrl(_ url: String) -> Bool {
+        patternLock.lock()
+        let patterns = cacheablePatterns
+        patternLock.unlock()
+        for pattern in patterns where url.contains(pattern) {
+            return true
+        }
         return false
     }
 
@@ -233,7 +254,7 @@ enum MapLibreDartTileBridge {
 
     /// Synchronous memory probe — safe from any thread, never touches Flutter.
     static func cached(url: String) -> MapLibreTileEntry? {
-        guard isTileUrl(url) else { return nil }
+        guard isCacheableUrl(url) else { return nil }
         return mem.get(url)
     }
 
@@ -242,7 +263,7 @@ enum MapLibreDartTileBridge {
     /// [completion] runs on the bridge queue and always runs exactly once —
     /// `nil` means "not cached, go to the network".
     static func lookup(url: String, completion: @escaping (MapLibreTileEntry?) -> Void) {
-        guard isTileUrl(url) else {
+        guard isCacheableUrl(url) else {
             completion(nil)
             return
         }
@@ -321,7 +342,7 @@ enum MapLibreDartTileBridge {
     /// Records a network-fetched tile: memory immediately, Dart on the next
     /// batch flush.
     static func put(url: String, data: Data, contentType: String?, etag: String?) {
-        guard isTileUrl(url) else { return }
+        guard isCacheableUrl(url) else { return }
         let entry = MapLibreTileEntry(data: data, contentType: contentType, etag: etag)
         mem.put(url, entry)
         queue.async {
