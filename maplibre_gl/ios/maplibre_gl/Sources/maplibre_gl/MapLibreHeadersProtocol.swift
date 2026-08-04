@@ -256,9 +256,16 @@ final class MapLibreHeadersProtocol: URLProtocol {
             return
         }
 
-        let clientResponse = forwardingTile
-            ? Self.clientTileResponse(response, bodyLength: body.count)
-            : response
+        // Always restamp: URLSession often leaves `Content-Encoding: gzip` on an
+        // already-inflated body. Gating this on `forwardingTile` was a footgun —
+        // that flag is only set when Dart has registered cacheable URL patterns,
+        // and `setCacheablePatterns` is a no-op if called before the plugin binds
+        // (bootstrap), so DPM AED tiles never got the strip and MapLibre
+        // double-gunzipped them into silence.
+        let clientResponse = Self.clientTileResponse(
+            response,
+            bodyLength: body.count
+        )
         client?.urlProtocol(
             self,
             didReceive: clientResponse,

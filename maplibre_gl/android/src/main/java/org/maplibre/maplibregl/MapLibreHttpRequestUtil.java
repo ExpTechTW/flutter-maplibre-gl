@@ -218,16 +218,24 @@ abstract class MapLibreHttpRequestUtil {
     }
 
     Response response = chain.proceed(reqBuilder.build());
-    if (!MapLibreDartTileBridge.isCacheableUrl(url)) return response;
 
-    // Transparent gzip leaves a plain body; strip Content-Encoding so MapLibre
-    // does not try to inflate again (same footgun as the iOS URLProtocol path).
+    // Always strip Content-Encoding. OkHttp usually decompresses already; when
+    // the header survives, MapLibre double-gunzips (same iOS footgun). Do not
+    // gate on isCacheableUrl — that is false until Dart registers patterns, and
+    // bootstrap often calls setCacheablePatterns before the plugin is attached.
     Response.Builder rebuilt = response.newBuilder().removeHeader("Content-Encoding");
     String cacheControl = response.header("Cache-Control");
     if (cacheControl == null
         || cacheControl.toLowerCase(Locale.US).contains("no-store")) {
-      rebuilt.header("Cache-Control", TILE_CACHE_CONTROL);
+      if (MapLibreDartTileBridge.isCacheableUrl(url)) {
+        rebuilt.header("Cache-Control", TILE_CACHE_CONTROL);
+      }
     }
+
+    if (!MapLibreDartTileBridge.isCacheableUrl(url)) {
+      return rebuilt.build();
+    }
+
     if ((response.code() == 200 || response.code() == 404) && response.body() != null) {
       ResponseBody body = response.body();
       long contentLength = body.contentLength();
