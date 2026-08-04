@@ -124,15 +124,42 @@ final class MapLibreHeadersProtocol: URLProtocol {
         task?.cancel()
     }
 
-    /// Restamps a live tile response with [tileCacheControl] so MapLibre keeps
-    /// it. Origins that already say something about freshness are left alone.
-    private static func withTileFreshness(_ response: URLResponse) -> URLResponse {
+    /// Restamps a live tile response for MapLibre consumption.
+    ///
+    /// URLSession transparently inflates gzip, but often **leaves**
+    /// `Content-Encoding: gzip` on the response. Forwarding that header with an
+    /// already-plain body makes MapLibre gunzip again and drop the tile —
+    /// silent blank for MVT feeds like DPM AED (`application/vnd.mapbox-vector-tile`).
+    /// Basemap PBF is more forgiving, which is why the map looked fine without
+    /// AED. Strip encoding, rewrite length, and (when the origin said nothing)
+    /// advertise [tileCacheControl].
+    private static func clientTileResponse(
+        _ response: URLResponse,
+        bodyLength: Int
+    ) -> URLResponse {
         guard let http = response as? HTTPURLResponse,
-              let url = http.url,
-              http.value(forHTTPHeaderField: "Cache-Control") == nil
+              let url = http.url
         else { return response }
-        var headers = http.allHeaderFields as? [String: String] ?? [:]
-        headers["Cache-Control"] = tileCacheControl
+
+        var headers: [String: String] = [:]
+        for (key, value) in http.allHeaderFields {
+            guard let name = key as? String else { continue }
+            let lower = name.lowercased()
+            if lower == "content-encoding" || lower == "content-length" {
+                continue
+            }
+            headers[name] = "\(value)"
+        }
+        headers["Content-Length"] = "\(bodyLength)"
+        // Origin `no-store` (CDN) fights MapLibre's ambient DB and forces every
+        // reveal back through this bridge. DPM / radar / satellite URLs are
+        // content-addressed by z/x/y — restamp so a decoded tile sticks.
+        if http.value(forHTTPHeaderField: "Cache-Control") == nil
+            || http.value(forHTTPHeaderField: "Cache-Control")?
+            .localizedCaseInsensitiveContains("no-store") == true
+        {
+            headers["Cache-Control"] = tileCacheControl
+        }
         return HTTPURLResponse(
             url: url,
             statusCode: http.statusCode,
@@ -229,9 +256,12 @@ final class MapLibreHeadersProtocol: URLProtocol {
             return
         }
 
+        let clientResponse = forwardingTile
+            ? Self.clientTileResponse(response, bodyLength: body.count)
+            : response
         client?.urlProtocol(
             self,
-            didReceive: forwardingTile ? Self.withTileFreshness(response) : response,
+            didReceive: clientResponse,
             cacheStoragePolicy: .notAllowed
         )
         if !body.isEmpty {
@@ -246,6 +276,7 @@ final class MapLibreHeadersProtocol: URLProtocol {
            let url = http.url?.absoluteString ?? request.url?.absoluteString
         {
             // 200 body or basemap-style 404 hole — both land in Dart SQLite.
+            // Body is already inflated (URLSession); never store gzip framing.
             MapLibreDartTileBridge.put(
                 url: url,
                 data: body,

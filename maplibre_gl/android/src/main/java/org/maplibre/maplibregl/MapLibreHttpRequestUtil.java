@@ -5,6 +5,7 @@ import org.maplibre.android.module.http.HttpRequestUtil;
 import io.flutter.plugin.common.MethodChannel;
 import java.io.IOException;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 import java.util.concurrent.TimeUnit;
@@ -219,9 +220,12 @@ abstract class MapLibreHttpRequestUtil {
     Response response = chain.proceed(reqBuilder.build());
     if (!MapLibreDartTileBridge.isCacheableUrl(url)) return response;
 
-    // Origins that already state their own freshness are left alone.
-    Response.Builder rebuilt = response.newBuilder();
-    if (response.header("Cache-Control") == null) {
+    // Transparent gzip leaves a plain body; strip Content-Encoding so MapLibre
+    // does not try to inflate again (same footgun as the iOS URLProtocol path).
+    Response.Builder rebuilt = response.newBuilder().removeHeader("Content-Encoding");
+    String cacheControl = response.header("Cache-Control");
+    if (cacheControl == null
+        || cacheControl.toLowerCase(Locale.US).contains("no-store")) {
       rebuilt.header("Cache-Control", TILE_CACHE_CONTROL);
     }
     if ((response.code() == 200 || response.code() == 404) && response.body() != null) {
@@ -231,7 +235,9 @@ abstract class MapLibreHttpRequestUtil {
         byte[] bytes = body.bytes();
         MapLibreDartTileBridge.put(
             url, bytes, response.header("Content-Type"), response.header("ETag"));
-        rebuilt.body(ResponseBody.create(bytes, body.contentType()));
+        rebuilt
+            .body(ResponseBody.create(bytes, body.contentType()))
+            .header("Content-Length", String.valueOf(bytes.length));
       }
     }
     return rebuilt.build();
