@@ -236,7 +236,9 @@ abstract class MapLibreHttpRequestUtil {
       return rebuilt.build();
     }
 
-    if ((response.code() == 200 || response.code() == 404) && response.body() != null) {
+    // 200 only: a 404 body is the origin's error text, not the asset, and these
+    // URLs are served `immutable` so a cached error is never revalidated away.
+    if (response.code() == 200 && response.body() != null) {
       ResponseBody body = response.body();
       long contentLength = body.contentLength();
       if (contentLength >= 0 && contentLength <= MAX_PUT_BYTES) {

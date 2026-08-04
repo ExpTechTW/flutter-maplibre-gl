@@ -285,12 +285,16 @@ final class MapLibreHeadersProtocol: URLProtocol {
 
         if forwardingTile,
            let http = response as? HTTPURLResponse,
-           http.statusCode == 200 || http.statusCode == 404,
-           !body.isEmpty || http.statusCode == 404,
+           http.statusCode == 200,
+           !body.isEmpty,
            body.count <= Self.maxPutBytes,
            let url = http.url?.absoluteString ?? request.url?.absoluteString
         {
-            // 200 body or basemap-style 404 hole — both land in Dart SQLite.
+            // **200 only.** A 404 body is the origin's error text, not the
+            // asset: caching one and replaying it as a synthetic 200 hands
+            // MapLibre garbage forever, because these URLs are served
+            // `immutable` and never revalidated. A missing glyph range cached
+            // this way silently broke every tile that needed a label.
             // Body is already inflated (URLSession); never store gzip framing.
             MapLibreDartTileBridge.put(
                 url: url,
