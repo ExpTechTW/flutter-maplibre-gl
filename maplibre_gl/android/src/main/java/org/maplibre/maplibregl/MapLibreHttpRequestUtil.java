@@ -3,12 +3,15 @@ package org.maplibre.maplibregl;
 import androidx.annotation.Nullable;
 import org.maplibre.android.module.http.HttpRequestUtil;
 import io.flutter.plugin.common.MethodChannel;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPInputStream;
 import okhttp3.Call;
 import okhttp3.Dispatcher;
 import okhttp3.Interceptor;
@@ -147,9 +150,14 @@ abstract class MapLibreHttpRequestUtil {
         currentMaxRequestsPerHost != null ? currentMaxRequestsPerHost : 16);
     builder.dispatcher(dispatcher);
 
-    // App interceptor: Dart hit short-circuits. Network interceptor: headers + put.
+    // Both are application interceptors. OkHttp transparently gunzips gzip
+    // responses in its BridgeInterceptor, which sits *outside* network
+    // interceptors — a network interceptor would read raw gzip bytes, repack
+    // them as the body, and (after stripping Content-Encoding) hand MapLibre
+    // compressed data it then fails to decode as PBF/bitmap (blank basemap +
+    // radar on Android only; iOS's URLSession inflates automatically).
     builder.addInterceptor(MapLibreHttpRequestUtil::serveFromDart);
-    builder.addNetworkInterceptor(MapLibreHttpRequestUtil::applyHeadersAndPut);
+    builder.addInterceptor(MapLibreHttpRequestUtil::applyHeadersAndPut);
 
     OkHttpClient built = builder.build();
     client = built;
@@ -243,6 +251,13 @@ abstract class MapLibreHttpRequestUtil {
       long contentLength = body.contentLength();
       if (contentLength >= 0 && contentLength <= MAX_PUT_BYTES) {
         byte[] bytes = body.bytes();
+        // Double insurance: as an application interceptor the body should
+        // already be inflated (OkHttp's bridge gunzips before it reaches us),
+        // but if a request ever carries its own Accept-Encoding OkHttp skips
+        // that — inflate here so MapLibre never receives gzip framing.
+        if ("gzip".equalsIgnoreCase(response.header("Content-Encoding"))) {
+          bytes = gunzip(bytes);
+        }
         MapLibreDartTileBridge.put(
             url, bytes, response.header("Content-Type"), response.header("ETag"));
         rebuilt
@@ -251,5 +266,21 @@ abstract class MapLibreHttpRequestUtil {
       }
     }
     return rebuilt.build();
+  }
+
+  private static byte[] gunzip(byte[] compressed) {
+    try (GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(compressed));
+        ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+      byte[] buffer = new byte[8192];
+      int n;
+      while ((n = in.read(buffer)) != -1) {
+        out.write(buffer, 0, n);
+      }
+      return out.toByteArray();
+    } catch (IOException e) {
+      // A bad gzip stream is worse than none — return the original bytes so
+      // the caller still hands MapLibre *something* (it may be plain anyway).
+      return compressed;
+    }
   }
 }
