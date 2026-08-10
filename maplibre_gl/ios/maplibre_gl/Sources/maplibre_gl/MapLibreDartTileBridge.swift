@@ -91,6 +91,14 @@ private final class MapLibreTileMemStore {
         }
     }
 
+    /// Current memory usage and the cap, for the Dart side to decide how much
+    /// more it may inject before the mirror trims.
+    func usage() -> (used: Int, limit: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (bytes, limit)
+    }
+
     private func trimLocked() {
         guard bytes > limit else { return }
         let target = Int(Double(limit) * Self.trimTarget)
@@ -179,7 +187,10 @@ enum MapLibreDartTileBridge {
                         etag: row["etag"] as? String
                     ))
                 }
-                result(nil)
+                // Echo the post-injection usage back so Dart can stop injecting
+                // when the mirror is near full, without a second round-trip.
+                let usage = mem.usage()
+                result(["used": usage.used, "limit": usage.limit])
 
             case "filterMissing":
                 let args = call.arguments as? [String: Any]

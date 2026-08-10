@@ -181,6 +181,21 @@ MapLibreTile? _tileFromWire(Object? entry) {
   );
 }
 
+/// Native's in-process tile mirror usage after an inject — lets Dart keep
+/// filling until the mirror is near its cap and stop instead of churning.
+class TileMemoryUsage {
+  const TileMemoryUsage({required this.used, required this.limit});
+
+  /// Bytes currently held by the mirror.
+  final int used;
+
+  /// The mirror's byte cap ([setMapLibreTileMemoryLimit]).
+  final int limit;
+
+  /// Whether the mirror is at or past [limit] (native trims beyond it).
+  bool get full => limit > 0 && used >= limit;
+}
+
 /// Pushes [tiles] into native's in-process mirror so the next request for them
 /// resolves with **no IPC and no network**.
 ///
@@ -188,14 +203,24 @@ MapLibreTile? _tileFromWire(Object? entry) {
 /// heading for injects its tiles before revealing it, turning a scrub into
 /// pure compositing. Pair with [mapLibreTilesMissing] to avoid re-sending
 /// bytes native already holds.
-Future<void> injectMapLibreTiles(List<MapLibreTile> tiles) async {
-  if (tiles.isEmpty) return;
+///
+/// Returns the mirror's post-injection usage, or null when the plugin isn't
+/// attached — so a caller filling the mirror can stop once it is near full.
+Future<TileMemoryUsage?> injectMapLibreTiles(List<MapLibreTile> tiles) async {
+  if (tiles.isEmpty) return null;
   try {
-    await _tileCacheChannel.invokeMethod<void>('injectTiles', {
-      'entries': [for (final tile in tiles) tile._toWire()],
-    });
+    final result = await _tileCacheChannel.invokeMethod<Map<Object?, Object?>>(
+      'injectTiles',
+      {'entries': [for (final tile in tiles) tile._toWire()]},
+    );
+    if (result == null) return null;
+    return TileMemoryUsage(
+      used: result['used'] as int? ?? 0,
+      limit: result['limit'] as int? ?? 0,
+    );
   } catch (_) {
     // Plugin not attached / binding not ready (tests, early bootstrap).
+    return null;
   }
 }
 

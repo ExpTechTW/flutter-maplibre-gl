@@ -139,6 +139,12 @@ final class MapLibreDartTileBridge {
       }
     }
 
+    /** Current memory usage and the cap, for the Dart side to decide how much
+     * more it may inject before the mirror trims. */
+    synchronized int[] usage() {
+      return new int[] {bytes, limit};
+    }
+
     private void trim() {
       Iterator<Map.Entry<String, Entry>> it = map.entrySet().iterator();
       while (bytes > limit && it.hasNext()) {
@@ -171,7 +177,13 @@ final class MapLibreDartTileBridge {
                     }
                   }
                 }
-                result.success(null);
+                // Echo the post-injection usage back so Dart can stop injecting
+                // when the mirror is near full, without a second round-trip.
+                int[] usage = mem.usage();
+                Map<String, Object> out = new HashMap<>();
+                out.put("used", usage[0]);
+                out.put("limit", usage[1]);
+                result.success(out);
                 return;
               }
             case "filterMissing":
