@@ -120,6 +120,9 @@ class FakeMapLibrePlatform extends MapLibrePlatform {
   Future<void> setMaximumFps(int fps) async {}
 
   @override
+  Future<void> setRenderPaused(bool paused) async {}
+
+  @override
   Future<void> forceOnlineMode() async {}
 
   @override

@@ -349,6 +349,11 @@ class MapLibreMapController extends MapLibrePlatform
   }
 
   @override
+  Future<void> setRenderPaused(bool paused) async {
+    // No-op: the web map only renders while visible; pausing has no benefit.
+  }
+
+  @override
   Future<void> forceOnlineMode() async {
     // Web implementation: Force online mode
     // In web, we can ensure network requests are enabled

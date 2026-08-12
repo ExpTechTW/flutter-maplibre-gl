@@ -1129,6 +1129,26 @@ final class MapLibreMapController
           result.success(null);
           break;
         }
+      case "map#pause":
+        {
+          // Stops the render loop while keeping the map's state (camera,
+          // sources, tiles) intact. Safe to call repeatedly; the renderer is
+          // only paused if it is currently running. Tile downloads continue,
+          // so a hidden map can still warm its cache.
+          if (mapView != null) {
+            mapView.onPause();
+          }
+          result.success(null);
+          break;
+        }
+      case "map#resume":
+        {
+          if (mapView != null) {
+            mapView.onResume();
+          }
+          result.success(null);
+          break;
+        }
       case "map#forceOnlineMode":
         {
           // Force online mode by setting connectivity to true

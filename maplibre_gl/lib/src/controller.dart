@@ -1019,6 +1019,17 @@ class MapLibreMapController extends ChangeNotifier {
     return _maplibrePlatform.setMaximumFps(fps);
   }
 
+  /// Pauses or resumes the map's native render loop.
+  ///
+  /// Pausing stops frame production on the platform side (the display link on
+  /// iOS, the renderer on Android) while keeping the map's state — camera,
+  /// loaded tiles, sources — fully intact. Resume continues exactly where it
+  /// left off. Use this to stop a hidden map (e.g. a tab kept alive in an
+  /// `IndexedStack`) from consuming GPU.
+  Future<void> setRenderPaused(bool paused) async {
+    return _maplibrePlatform.setRenderPaused(paused);
+  }
+
   /// Forces the map to use online mode, disabling any offline functionality.
   ///
   /// This is useful for testing or when you want to ensure the map always

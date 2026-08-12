@@ -281,6 +281,11 @@ class MapLibreMethodChannel extends MapLibrePlatform {
   }
 
   @override
+  Future<void> setRenderPaused(bool paused) async {
+    await _channel.invokeMethod(paused ? 'map#pause' : 'map#resume');
+  }
+
+  @override
   Future<void> forceOnlineMode() async {
     await _channel.invokeMethod('map#forceOnlineMode');
   }

@@ -124,6 +124,12 @@ abstract class MapLibrePlatform {
   /// Sets the maximum frames per second for the map rendering.
   Future<void> setMaximumFps(int fps);
 
+  /// Pauses or resumes the map's render loop while keeping its state (camera,
+  /// sources, tiles) intact. Pausing a hidden map (e.g. an offstage tab in an
+  /// `IndexedStack`) stops its native frame production so it stops burning GPU;
+  /// the map resumes exactly where it was.
+  Future<void> setRenderPaused(bool paused);
+
   /// Forces the map to use online mode (disables offline mode).
   Future<void> forceOnlineMode();
 
