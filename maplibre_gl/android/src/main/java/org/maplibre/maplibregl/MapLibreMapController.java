@@ -147,6 +147,18 @@ final class MapLibreMapController
   private boolean dragEnabled = true;
   private boolean featureTapsTriggersMapClick = false;
   private boolean mapViewStarted = false;
+
+  /**
+   * Whether Dart asked for this map to stop rendering (map#pause).
+   *
+   * Held separately from {@link #mapViewStarted} because the two pause sources are independent: the
+   * activity lifecycle stops every map when the app backgrounds, and Dart stops individual maps that
+   * are off-screen while the app stays in the foreground. Without this flag the lifecycle observer's
+   * onStart/onResume restart every controller unconditionally, so the first time the user
+   * backgrounded and returned, every Dart-paused map came back to life for the rest of the session.
+   */
+  private boolean pausedByDart = false;
+
   private MethodChannel.Result mapReadyResult;
   private LocationComponent locationComponent = null;
   private LocationEngineCallback<LocationEngineResult> locationEngineCallback = null;
@@ -1133,18 +1145,36 @@ final class MapLibreMapController
         {
           // Stops the render loop while keeping the map's state (camera,
           // sources, tiles) intact. Safe to call repeatedly; the renderer is
-          // only paused if it is currently running. Tile downloads continue,
+          // only stopped if it is currently running. Tile downloads continue,
           // so a hidden map can still warm its cache.
-          if (mapView != null) {
-            mapView.onPause();
+          //
+          // onStop(), NOT onPause(). With the OpenGL SurfaceView renderer this
+          // plugin ships (android-sdk-opengl 13.3.0), MapView.onPause() calls
+          // MapRenderer.onPause(), and SurfaceViewMapRenderer overrides that
+          // with a body of nothing but super.onPause() — whose bytecode is a
+          // bare `return`. The call that actually parks the render thread is
+          // SurfaceViewMapRenderer.onStop() -> MapLibreSurfaceView.onPause() ->
+          // RenderThread.onPause(), reachable only through MapView.onStop().
+          // So the previous onPause() here was a no-op and every "paused" map
+          // kept rendering.
+          //
+          // pausedByDart keeps this decision from being undone by the activity
+          // lifecycle: onStart/onResume below would otherwise restart a map
+          // Dart deliberately stopped, on the next app foreground.
+          pausedByDart = true;
+          if (mapView != null && mapViewStarted) {
+            mapView.onStop();
+            mapViewStarted = false;
           }
           result.success(null);
           break;
         }
       case "map#resume":
         {
-          if (mapView != null) {
-            mapView.onResume();
+          pausedByDart = false;
+          if (mapView != null && !mapViewStarted) {
+            mapView.onStart();
+            mapViewStarted = true;
           }
           result.success(null);
           break;
@@ -2367,6 +2397,12 @@ final class MapLibreMapController
     if (disposed || mapView == null) {
       return;
     }
+    // A map Dart parked with map#pause stays parked across a background round
+    // trip. Restarting it here would silently and permanently undo that: the
+    // Dart side has no way to know it happened, so it never re-issues map#pause.
+    if (pausedByDart) {
+      return;
+    }
     if (!mapViewStarted) {
       mapView.onStart();
       mapViewStarted = true;
@@ -2376,6 +2412,11 @@ final class MapLibreMapController
   @Override
   public void onResume(@NonNull LifecycleOwner owner) {
     if (disposed || mapView == null) {
+      return;
+    }
+    // Same reasoning as onStart: neither the location updates nor the forced
+    // repaint below belong to a map nobody is looking at.
+    if (pausedByDart) {
       return;
     }
     mapView.onResume();

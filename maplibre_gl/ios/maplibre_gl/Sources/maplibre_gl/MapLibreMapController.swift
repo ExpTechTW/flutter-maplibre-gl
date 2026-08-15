@@ -215,6 +215,29 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         )
     }
 
+    /// The frame rate a paused map runs at.
+    ///
+    /// **Not zero.** `MLNMapViewPreferredFramesPerSecond` is an
+    /// `NS_TYPED_EXTENSIBLE_ENUM` over `NSInteger` whose members are declared
+    /// `FOUNDATION_EXTERN const`, so the header shows the names and not the
+    /// values. Read out of the shipped `MapLibre.xcframework` binary they are:
+    ///
+    ///     MLNMapViewPreferredFramesPerSecondDefault  = -1   (adaptive 30/60)
+    ///     MLNMapViewPreferredFramesPerSecondLowPower = 30
+    ///     MLNMapViewPreferredFramesPerSecondMaximum  =  0
+    ///
+    /// The property forwards to `CADisplayLink.preferredFramesPerSecond`, where
+    /// 0 likewise means "the display's native cadence". Both pause paths here
+    /// used to write `rawValue: 0` — i.e. **Maximum** — so pausing a map made it
+    /// render faster than the adaptive rate it runs at normally, on every hidden
+    /// tab and every backgrounded app.
+    ///
+    /// MLNMapView exposes no stop: `preferredFramesPerSecond` and
+    /// `prefetchesTiles` are its only rendering controls, and the header states
+    /// the former accepts arbitrary integers. 1 is the cheapest value that still
+    /// leaves the link alive to be raised again.
+    private static let pausedFps = MLNMapViewPreferredFramesPerSecond(rawValue: 1)
+
     // Pausing the render loop before the OS suspends the process prevents a
     // SIGSEGV in PMTilesFileSource, which runs file I/O on a background thread
     // that can be torn down mid-read during app backgrounding (#833).
@@ -222,7 +245,7 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     // like incoming call banners or Control Center do not freeze the map.
     @objc private func appDidEnterBackground() {
         isBackgroundPaused = true
-        mapView.preferredFramesPerSecond = MLNMapViewPreferredFramesPerSecond(rawValue: 0)
+        mapView.preferredFramesPerSecond = MapLibreMapController.pausedFps
     }
 
     @objc private func appWillEnterForeground() {
@@ -413,7 +436,7 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
             result(nil)
         case "map#pause":
             pausedByDart = true
-            mapView.preferredFramesPerSecond = MLNMapViewPreferredFramesPerSecond(rawValue: 0)
+            mapView.preferredFramesPerSecond = MapLibreMapController.pausedFps
             result(nil)
         case "map#resume":
             pausedByDart = false
