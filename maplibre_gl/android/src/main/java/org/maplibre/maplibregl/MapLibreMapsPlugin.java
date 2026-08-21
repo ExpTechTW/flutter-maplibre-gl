@@ -35,8 +35,9 @@ public class MapLibreMapsPlugin implements FlutterPlugin, ActivityAware {
   public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
     flutterAssets = binding.getFlutterAssets();
 
-    // Reduce MapLibre SDK logging verbosity to prevent spam from HTTP requests
-    // INFO level includes informational messages, warnings, and errors while suppressing verbose HTTP logs
+    // MapLibre reports OkHttp Call.cancel() as a permanent WARN even though cancelling abandoned
+    // tiles is expected control flow. Keep every other diagnostic and suppress only that message.
+    Logger.setLoggerDefinition(new MapLibreLogger());
     Logger.setVerbosity(Logger.INFO);
 
     MethodChannel methodChannel =
