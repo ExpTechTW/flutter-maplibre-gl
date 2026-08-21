@@ -104,6 +104,26 @@ void main() {
       },
     );
 
+    test('setLayerPropertiesBatch uses one native call', () async {
+      final updates = <Map<String, dynamic>>[
+        {
+          'layerId': 'old-frame',
+          'properties': {'raster-opacity': 0.0},
+        },
+        {
+          'layerId': 'new-frame',
+          'properties': {'raster-opacity': 0.85},
+        },
+      ];
+
+      await platform.setLayerPropertiesBatch(updates);
+
+      expect(methodCalls, hasLength(1));
+      expect(methodCalls.single.method, 'layer#setPropertiesBatch');
+      final args = methodCalls.single.arguments as Map;
+      expect(args['updates'], updates);
+    });
+
     test('addLineLayer passes array properties correctly', () async {
       final properties = {
         'line-color': '#0000FF',

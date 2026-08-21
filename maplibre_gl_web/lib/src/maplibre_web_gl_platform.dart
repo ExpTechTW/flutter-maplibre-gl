@@ -1398,6 +1398,18 @@ class MapLibreMapController extends MapLibrePlatform
   }
 
   @override
+  Future<void> setLayerPropertiesBatch(
+    List<Map<String, dynamic>> updates,
+  ) async {
+    for (final update in updates) {
+      await setLayerProperties(
+        update['layerId'] as String,
+        update['properties'] as Map<String, dynamic>,
+      );
+    }
+  }
+
+  @override
   Future<void> addSymbolLayer(
     String sourceId,
     String layerId,

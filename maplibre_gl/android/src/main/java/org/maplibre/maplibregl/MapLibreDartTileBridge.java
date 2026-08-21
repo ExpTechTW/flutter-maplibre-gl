@@ -2,12 +2,15 @@ package org.maplibre.maplibregl;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Base64;
 import androidx.annotation.Nullable;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodChannel;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -42,11 +45,19 @@ final class MapLibreDartTileBridge {
     final byte[] data;
     @Nullable final String contentType;
     @Nullable final String etag;
+    @Nullable final Integer sourceSize;
+    final int bodyCost;
 
-    Entry(byte[] data, @Nullable String contentType, @Nullable String etag) {
+    Entry(
+        byte[] data,
+        @Nullable String contentType,
+        @Nullable String etag,
+        @Nullable Integer sourceSize) {
       this.data = data;
       this.contentType = contentType;
       this.etag = etag;
+      this.sourceSize = sourceSize;
+      this.bodyCost = data == TRANSPARENT_RGBA_PNG ? 0 : data.length;
     }
   }
 
@@ -59,10 +70,80 @@ final class MapLibreDartTileBridge {
   private static final int MAX_PUT_BATCH = 32;
   private static final int DEFAULT_MEMORY_LIMIT = 2 * 1024 * 1024;
 
+  /** {@code data: 1} on the MethodChannel expands to this shared body. */
+  private static final int TRANSPARENT_RGBA_PNG_WIRE_TOKEN = 1;
+  private static final byte[] MALFORMED_EMPTY_GIF =
+      Base64.decode("R0lGODlhAQABAAAAACH5BAEAAAAALAAAAAABAAEAAAIBADs=", Base64.DEFAULT);
+  private static final byte[] OPAQUE_BLACK_PLACEHOLDER_PNG =
+      Base64.decode(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+          Base64.DEFAULT);
+  private static final byte[] TRANSPARENT_RGBA_PNG =
+      Base64.decode(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=",
+          Base64.DEFAULT);
+  private static volatile boolean dartSupportsTransparentRgbaPngToken;
+
+  /** A body/content-type pair after exact empty-raster canonicalisation. */
+  static final class NormalizedPayload {
+    final byte[] data;
+    @Nullable final String contentType;
+    final boolean repaired;
+
+    NormalizedPayload(byte[] data, @Nullable String contentType, boolean repaired) {
+      this.data = data;
+      this.contentType = contentType;
+      this.repaired = repaired;
+    }
+  }
+
+  /** Canonicalises known empty raster bodies; valid tile bytes are untouched. */
+  static NormalizedPayload normalizeRasterPayload(
+      byte[] data, @Nullable String contentType) {
+    boolean knownEmpty =
+        Arrays.equals(data, MALFORMED_EMPTY_GIF)
+            || Arrays.equals(data, OPAQUE_BLACK_PLACEHOLDER_PNG)
+            || Arrays.equals(data, TRANSPARENT_RGBA_PNG);
+    if (!knownEmpty) return new NormalizedPayload(data, contentType, false);
+    boolean alreadyCanonical =
+        Arrays.equals(data, TRANSPARENT_RGBA_PNG)
+            && contentType != null
+            && contentType.toLowerCase(java.util.Locale.US).startsWith("image/png");
+    return new NormalizedPayload(TRANSPARENT_RGBA_PNG, "image/png", !alreadyCanonical);
+  }
+
+  @Nullable
+  private static Entry entryFromWire(
+      Object rawData,
+      @Nullable String contentType,
+      @Nullable String etag,
+      @Nullable Integer sourceSize) {
+    final byte[] data;
+    if (rawData instanceof Number
+        && ((Number) rawData).intValue() == TRANSPARENT_RGBA_PNG_WIRE_TOKEN) {
+      data = TRANSPARENT_RGBA_PNG;
+    } else if (rawData instanceof byte[]) {
+      data = (byte[]) rawData;
+    } else {
+      return null;
+    }
+    NormalizedPayload payload = normalizeRasterPayload(data, contentType);
+    return new Entry(payload.data, payload.contentType, etag, sourceSize);
+  }
+
+  private static Object wireData(byte[] data) {
+    return dartSupportsTransparentRgbaPngToken && data == TRANSPARENT_RGBA_PNG
+        ? TRANSPARENT_RGBA_PNG_WIRE_TOKEN
+        : data;
+  }
+
   private static final Object channelLock = new Object();
   private static final Object patternLock = new Object();
   private static List<String> cacheablePatterns = Collections.emptyList();
   private static MethodChannel channel;
+  private static BinaryMessenger activeMessenger;
+  private static final Map<BinaryMessenger, MethodChannel> attachedChannels =
+      new IdentityHashMap<>();
   private static final Handler main = new Handler(Looper.getMainLooper());
 
   private static final MemStore mem = new MemStore(DEFAULT_MEMORY_LIMIT);
@@ -114,8 +195,8 @@ final class MapLibreDartTileBridge {
 
     synchronized void put(String url, Entry entry) {
       Entry previous = map.put(url, entry);
-      if (previous != null) bytes -= previous.data.length;
-      bytes += entry.data.length;
+      if (previous != null) bytes -= previous.bodyCost;
+      bytes += entry.bodyCost;
       trim();
     }
 
@@ -131,7 +212,7 @@ final class MapLibreDartTileBridge {
         Map.Entry<String, Entry> row = it.next();
         for (String needle : needles) {
           if (row.getKey().contains(needle)) {
-            bytes -= row.getValue().data.length;
+            bytes -= row.getValue().bodyCost;
             it.remove();
             break;
           }
@@ -148,7 +229,7 @@ final class MapLibreDartTileBridge {
     private void trim() {
       Iterator<Map.Entry<String, Entry>> it = map.entrySet().iterator();
       while (bytes > limit && it.hasNext()) {
-        bytes -= it.next().getValue().data.length;
+        bytes -= it.next().getValue().bodyCost;
         it.remove();
       }
     }
@@ -157,8 +238,18 @@ final class MapLibreDartTileBridge {
   static void attach(BinaryMessenger messenger) {
     MethodChannel ch =
         new MethodChannel(messenger, "plugins.flutter.io/maplibre_gl/tile_cache");
+    synchronized (channelLock) {
+      attachedChannels.put(messenger, ch);
+    }
     ch.setMethodCallHandler(
         (call, result) -> {
+          // Receiving a Dart -> native cache command proves this engine owns
+          // the Dart cache handler. Firebase Messaging starts a background
+          // FlutterEngine on Android and registers every plugin there too, but
+          // that isolate never binds the tile cache. Eagerly replacing the
+          // process-wide channel from attach() routed all lookups to that
+          // handler-less engine, making every tile wait for GET_TIMEOUT_MS.
+          activate(messenger, ch);
           switch (call.method) {
             case "injectTiles":
               {
@@ -166,14 +257,14 @@ final class MapLibreDartTileBridge {
                 if (entries != null) {
                   for (Map<String, Object> row : entries) {
                     Object url = row.get("url");
-                    Object data = row.get("data");
-                    if (url instanceof String && data instanceof byte[]) {
-                      mem.put(
-                          (String) url,
-                          new Entry(
-                              (byte[]) data,
-                              (String) row.get("contentType"),
-                              (String) row.get("etag")));
+                    Entry entry =
+                        entryFromWire(
+                            row.get("data"),
+                            (String) row.get("contentType"),
+                            (String) row.get("etag"),
+                            null);
+                    if (url instanceof String && entry != null) {
+                      mem.put((String) url, entry);
                     }
                   }
                 }
@@ -216,7 +307,19 @@ final class MapLibreDartTileBridge {
               {
                 Integer bytes = call.argument("bytes");
                 mem.setLimit(bytes != null ? bytes : DEFAULT_MEMORY_LIMIT);
-                result.success(null);
+                List<Number> wireTokens = call.argument("wireTokens");
+                dartSupportsTransparentRgbaPngToken =
+                    wireTokens != null
+                        && wireTokens.stream()
+                            .anyMatch(
+                                token ->
+                                    token != null
+                                        && token.intValue()
+                                            == TRANSPARENT_RGBA_PNG_WIRE_TOKEN);
+                Map<String, Object> capabilities = new HashMap<>();
+                capabilities.put(
+                    "wireTokens", Collections.singletonList(TRANSPARENT_RGBA_PNG_WIRE_TOKEN));
+                result.success(capabilities);
                 return;
               }
             case "cancelPendingFetches":
@@ -227,9 +330,6 @@ final class MapLibreDartTileBridge {
               result.notImplemented();
           }
         });
-    synchronized (channelLock) {
-      channel = ch;
-    }
 
     // Pull what Dart wants cached, rather than waiting to be told.
     //
@@ -247,6 +347,7 @@ final class MapLibreDartTileBridge {
                   @Override
                   public void success(@Nullable Object result) {
                     if (!(result instanceof List)) return;
+                    activate(messenger, ch);
                     final List<String> patterns = new ArrayList<>();
                     for (Object item : (List<?>) result) {
                       if (item instanceof String) patterns.add((String) item);
@@ -262,6 +363,28 @@ final class MapLibreDartTileBridge {
                   @Override
                   public void notImplemented() {}
                 }));
+  }
+
+  /** Stops a detached/background engine from retaining the process-wide bridge. */
+  static void detach(BinaryMessenger messenger) {
+    final MethodChannel detached;
+    synchronized (channelLock) {
+      detached = attachedChannels.remove(messenger);
+      if (activeMessenger == messenger) {
+        activeMessenger = null;
+        channel = null;
+      }
+    }
+    if (detached != null) detached.setMethodCallHandler(null);
+  }
+
+  /** Selects only an engine that has proved its Dart tile handler is alive. */
+  private static void activate(BinaryMessenger messenger, MethodChannel candidate) {
+    synchronized (channelLock) {
+      if (attachedChannels.get(messenger) != candidate) return;
+      activeMessenger = messenger;
+      channel = candidate;
+    }
   }
 
   @Nullable
@@ -361,13 +484,13 @@ final class MapLibreDartTileBridge {
                       Object raw = payload == null ? null : payload.get(row.getKey());
                       if (raw instanceof Map) {
                         Map<?, ?> hit = (Map<?, ?>) raw;
-                        Object data = hit.get("data");
-                        if (data instanceof byte[]) {
-                          entry =
-                              new Entry(
-                                  (byte[]) data,
-                                  (String) hit.get("contentType"),
-                                  (String) hit.get("etag"));
+                        entry =
+                            entryFromWire(
+                                hit.get("data"),
+                                (String) hit.get("contentType"),
+                                (String) hit.get("etag"),
+                                null);
+                        if (entry != null) {
                           mem.put(row.getKey(), entry);
                         }
                       }
@@ -389,14 +512,20 @@ final class MapLibreDartTileBridge {
 
   /** Records a network-fetched tile: memory now, Dart on the next batch flush. */
   static void put(
-      String url, byte[] data, @Nullable String contentType, @Nullable String etag) {
+      String url,
+      byte[] data,
+      @Nullable String contentType,
+      @Nullable String etag,
+      int sourceSize) {
     if (!isCacheableUrl(url) || data == null) return;
-    mem.put(url, new Entry(data, contentType, etag));
+    NormalizedPayload payload = normalizeRasterPayload(data, contentType);
+    Entry entry = new Entry(payload.data, payload.contentType, etag, sourceSize);
+    mem.put(url, entry);
     if (activeChannel() == null) return;
 
     boolean flushNow = false;
     synchronized (batchLock) {
-      pendingPuts.put(url, new Entry(data, contentType, etag));
+      pendingPuts.put(url, entry);
       if (pendingPuts.size() >= MAX_PUT_BATCH) {
         flushNow = true;
       } else if (!putFlushScheduled) {
@@ -422,9 +551,10 @@ final class MapLibreDartTileBridge {
     for (Map.Entry<String, Entry> row : batch.entrySet()) {
       Map<String, Object> item = new HashMap<>();
       item.put("url", row.getKey());
-      item.put("data", row.getValue().data);
+      item.put("data", wireData(row.getValue().data));
       if (row.getValue().contentType != null) item.put("contentType", row.getValue().contentType);
       if (row.getValue().etag != null) item.put("etag", row.getValue().etag);
+      if (row.getValue().sourceSize != null) item.put("sourceSize", row.getValue().sourceSize);
       entries.add(item);
     }
     Map<String, Object> args = new HashMap<>();

@@ -6,11 +6,21 @@ final class MapLibreTileEntry: NSObject {
     let data: Data
     let contentType: String?
     let etag: String?
+    let sourceSize: Int?
+    let bodyCost: Int
 
-    init(data: Data, contentType: String?, etag: String?) {
+    init(
+        data: Data,
+        contentType: String?,
+        etag: String?,
+        sourceSize: Int? = nil,
+        bodyCost: Int? = nil
+    ) {
         self.data = data
         self.contentType = contentType
         self.etag = etag
+        self.sourceSize = sourceSize
+        self.bodyCost = bodyCost ?? data.count
     }
 }
 
@@ -68,11 +78,11 @@ private final class MapLibreTileMemStore {
         lock.lock()
         defer { lock.unlock() }
         if let existing = slots[url] {
-            bytes -= existing.entry.data.count
+            bytes -= existing.entry.bodyCost
         }
         clock += 1
         slots[url] = Slot(entry: entry, usedAt: clock)
-        bytes += entry.data.count
+        bytes += entry.bodyCost
         trimLocked()
     }
 
@@ -87,7 +97,7 @@ private final class MapLibreTileMemStore {
         }
         for (url, slot) in slots where needles.contains(where: { url.contains($0) }) {
             slots.removeValue(forKey: url)
-            bytes -= slot.entry.data.count
+            bytes -= slot.entry.bodyCost
         }
     }
 
@@ -105,7 +115,7 @@ private final class MapLibreTileMemStore {
         for url in slots.sorted(by: { $0.value.usedAt < $1.value.usedAt }).map(\.key) {
             guard bytes > target else { return }
             if let slot = slots.removeValue(forKey: url) {
-                bytes -= slot.entry.data.count
+                bytes -= slot.entry.bodyCost
             }
         }
     }
@@ -152,6 +162,70 @@ enum MapLibreDartTileBridge {
 
     private static let defaultMemoryLimit = 2 * 1024 * 1024
 
+    /// `data: 1` on the MethodChannel expands to this process-wide body.
+    /// Empty radar tiles occur under thousands of distinct URLs, so repeating
+    /// the same 68 bytes only creates codec copies and GC pressure.
+    private static let transparentRgbaPngWireToken = 1
+    private static let malformedEmptyGif = Data(
+        base64Encoded: "R0lGODlhAQABAAAAACH5BAEAAAAALAAAAAABAAEAAAIBADs="
+    )!
+    private static let opaqueBlackPlaceholderPng = Data(
+        base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )!
+    private static let transparentRgbaPng = Data(
+        base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII="
+    )!
+    private static var dartSupportsTransparentRgbaPngToken = false
+
+    /// Canonicalises every known empty-raster representation before it reaches
+    /// MapLibre, L1, or Dart. Exact-body matching cannot rewrite a valid tile.
+    static func normalizeRasterPayload(
+        data: Data,
+        contentType: String?
+    ) -> (data: Data, contentType: String?, repaired: Bool) {
+        let knownEmpty = data == malformedEmptyGif
+            || data == opaqueBlackPlaceholderPng
+            || data == transparentRgbaPng
+        guard knownEmpty else {
+            return (data, contentType, false)
+        }
+        let alreadyCanonical = data == transparentRgbaPng
+            && contentType?.lowercased().hasPrefix("image/png") == true
+        return (transparentRgbaPng, "image/png", !alreadyCanonical)
+    }
+
+    private static func entryFromWire(
+        wireData: Any?,
+        contentType: String?,
+        etag: String?,
+        sourceSize: Int? = nil
+    ) -> MapLibreTileEntry? {
+        let data: Data
+        if let token = wireData as? Int,
+           token == transparentRgbaPngWireToken
+        {
+            data = transparentRgbaPng
+        } else if let typed = wireData as? FlutterStandardTypedData {
+            data = Data(typed.data)
+        } else {
+            return nil
+        }
+        let payload = normalizeRasterPayload(data: data, contentType: contentType)
+        return MapLibreTileEntry(
+            data: payload.data,
+            contentType: payload.contentType,
+            etag: etag,
+            sourceSize: sourceSize,
+            bodyCost: payload.data == transparentRgbaPng ? 0 : payload.data.count
+        )
+    }
+
+    private static func wireData(_ data: Data) -> Any {
+        dartSupportsTransparentRgbaPngToken && data == transparentRgbaPng
+            ? transparentRgbaPngWireToken
+            : FlutterStandardTypedData(bytes: data)
+    }
+
     // MARK: - State
 
     private static let queue = DispatchQueue(label: "org.maplibre.dart-tile-bridge")
@@ -168,6 +242,7 @@ enum MapLibreDartTileBridge {
     // MARK: - Attach
 
     static func attach(messenger: FlutterBinaryMessenger) {
+        dartSupportsTransparentRgbaPngToken = false
         let ch = FlutterMethodChannel(
             name: "plugins.flutter.io/maplibre_gl/tile_cache",
             binaryMessenger: messenger
@@ -179,13 +254,13 @@ enum MapLibreDartTileBridge {
                 let entries = args?["entries"] as? [[String: Any]] ?? []
                 for row in entries {
                     guard let url = row["url"] as? String,
-                          let typed = row["data"] as? FlutterStandardTypedData
+                          let entry = entryFromWire(
+                              wireData: row["data"],
+                              contentType: row["contentType"] as? String,
+                              etag: row["etag"] as? String
+                          )
                     else { continue }
-                    mem.put(url, MapLibreTileEntry(
-                        data: Data(typed.data),
-                        contentType: row["contentType"] as? String,
-                        etag: row["etag"] as? String
-                    ))
+                    mem.put(url, entry)
                 }
                 // Echo the post-injection usage back so Dart can stop injecting
                 // when the mirror is near full, without a second round-trip.
@@ -213,7 +288,11 @@ enum MapLibreDartTileBridge {
             case "setMemoryLimit":
                 let args = call.arguments as? [String: Any]
                 mem.setLimit(args?["bytes"] as? Int ?? defaultMemoryLimit)
-                result(nil)
+                let wireTokens = args?["wireTokens"] as? [Int] ?? []
+                dartSupportsTransparentRgbaPngToken = wireTokens.contains(
+                    transparentRgbaPngWireToken
+                )
+                result(["wireTokens": [transparentRgbaPngWireToken]])
 
             case "cancelPendingFetches":
                 let args = call.arguments as? [String: Any]
@@ -339,13 +418,12 @@ enum MapLibreDartTileBridge {
             for (url, waiters) in batch {
                 var entry: MapLibreTileEntry?
                 if let row = payload[url] as? [String: Any],
-                   let typed = row["data"] as? FlutterStandardTypedData
+                   let hit = entryFromWire(
+                       wireData: row["data"],
+                       contentType: row["contentType"] as? String,
+                       etag: row["etag"] as? String
+                   )
                 {
-                    let hit = MapLibreTileEntry(
-                        data: Data(typed.data),
-                        contentType: row["contentType"] as? String,
-                        etag: row["etag"] as? String
-                    )
                     mem.put(url, hit)
                     entry = hit
                 }
@@ -368,9 +446,22 @@ enum MapLibreDartTileBridge {
 
     /// Records a network-fetched tile: memory immediately, Dart on the next
     /// batch flush.
-    static func put(url: String, data: Data, contentType: String?, etag: String?) {
+    static func put(
+        url: String,
+        data: Data,
+        contentType: String?,
+        etag: String?,
+        sourceSize: Int? = nil
+    ) {
         guard isCacheableUrl(url) else { return }
-        let entry = MapLibreTileEntry(data: data, contentType: contentType, etag: etag)
+        let payload = normalizeRasterPayload(data: data, contentType: contentType)
+        let entry = MapLibreTileEntry(
+            data: payload.data,
+            contentType: payload.contentType,
+            etag: etag,
+            sourceSize: sourceSize,
+            bodyCost: payload.data == transparentRgbaPng ? 0 : payload.data.count
+        )
         mem.put(url, entry)
         queue.async {
             pendingPuts[url] = entry
@@ -399,10 +490,11 @@ enum MapLibreDartTileBridge {
         let entries: [[String: Any]] = batch.map { url, entry in
             var row: [String: Any] = [
                 "url": url,
-                "data": FlutterStandardTypedData(bytes: entry.data),
+                "data": wireData(entry.data),
             ]
             if let contentType = entry.contentType { row["contentType"] = contentType }
             if let etag = entry.etag { row["etag"] = etag }
+            if let sourceSize = entry.sourceSize { row["sourceSize"] = sourceSize }
             return row
         }
         DispatchQueue.main.async {

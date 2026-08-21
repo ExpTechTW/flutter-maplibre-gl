@@ -705,6 +705,25 @@ class MapLibreMapController extends ChangeNotifier {
     );
   }
 
+  /// Applies multiple layer-property changes in one platform round trip.
+  ///
+  /// This is useful when the changes form one visual transition, such as
+  /// hiding one raster frame while revealing the next. The native platforms
+  /// validate every target before applying the batch.
+  Future<void> setLayerPropertiesBatch(
+    List<({String layerId, LayerProperties properties})> updates, {
+    bool skipNulls = false,
+  }) async {
+    if (updates.isEmpty) return;
+    await _maplibrePlatform.setLayerPropertiesBatch([
+      for (final update in updates)
+        <String, dynamic>{
+          'layerId': update.layerId,
+          'properties': update.properties.toJson(skipNulls: skipNulls),
+        },
+    ]);
+  }
+
   /// Add a fill layer to the map with the given properties
   ///
   /// Consider using [addLayer] for an unified layer api.
@@ -1026,6 +1045,10 @@ class MapLibreMapController extends ChangeNotifier {
   /// loaded tiles, sources — fully intact. Resume continues exactly where it
   /// left off. Use this to stop a hidden map (e.g. a tab kept alive in an
   /// `IndexedStack`) from consuming GPU.
+  ///
+  /// On iOS, a resume completes only after the native map renders a frame. It
+  /// throws if the retained platform view cannot resume within a short timeout,
+  /// allowing callers to rebuild that view as a fallback.
   Future<void> setRenderPaused(bool paused) async {
     return _maplibrePlatform.setRenderPaused(paused);
   }

@@ -135,7 +135,8 @@ final class MapLibreHeadersProtocol: URLProtocol {
     /// advertise [tileCacheControl].
     private static func clientTileResponse(
         _ response: URLResponse,
-        bodyLength: Int
+        bodyLength: Int,
+        contentTypeOverride: String? = nil
     ) -> URLResponse {
         guard let http = response as? HTTPURLResponse,
               let url = http.url
@@ -145,12 +146,18 @@ final class MapLibreHeadersProtocol: URLProtocol {
         for (key, value) in http.allHeaderFields {
             guard let name = key as? String else { continue }
             let lower = name.lowercased()
-            if lower == "content-encoding" || lower == "content-length" {
+            if lower == "content-encoding"
+                || lower == "content-length"
+                || (contentTypeOverride != nil && lower == "content-type")
+            {
                 continue
             }
             headers[name] = "\(value)"
         }
         headers["Content-Length"] = "\(bodyLength)"
+        if let contentTypeOverride {
+            headers["Content-Type"] = contentTypeOverride
+        }
         // Origin `no-store` (CDN) fights MapLibre's ambient DB and forces every
         // reveal back through this bridge. DPM / radar / satellite URLs are
         // content-addressed by z/x/y — restamp so a decoded tile sticks.
@@ -242,7 +249,20 @@ final class MapLibreHeadersProtocol: URLProtocol {
             return
         }
 
-        let body = data ?? Data()
+        let upstreamBody = data ?? Data()
+        let upstreamContentType = (response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Content-Type")
+        // The origin's 35-byte empty GIF is invalid despite its `.webp` name.
+        // Canonicalise it before ImageIO, L1, or Dart sees it; the bridge also
+        // recognises the older opaque-black PNG left in existing caches.
+        let payload: (data: Data, contentType: String?, repaired: Bool) = forwardingTile
+            ? MapLibreDartTileBridge.normalizeRasterPayload(
+                data: upstreamBody,
+                contentType: upstreamContentType
+            )
+            : (data: upstreamBody, contentType: upstreamContentType, repaired: false)
+        let body = payload.data
+        let contentTypeOverride = payload.repaired ? payload.contentType : nil
         // Empty 200s make ImageIO probe garbage ("GIF" decode errors), so a
         // zero-byte *raster* tile is reported as a failure rather than decoded.
         //
@@ -272,7 +292,8 @@ final class MapLibreHeadersProtocol: URLProtocol {
         // double-gunzipped them into silence.
         let clientResponse = Self.clientTileResponse(
             response,
-            bodyLength: body.count
+            bodyLength: body.count,
+            contentTypeOverride: contentTypeOverride
         )
         client?.urlProtocol(
             self,
@@ -299,8 +320,9 @@ final class MapLibreHeadersProtocol: URLProtocol {
             MapLibreDartTileBridge.put(
                 url: url,
                 data: body,
-                contentType: http.value(forHTTPHeaderField: "Content-Type"),
-                etag: http.value(forHTTPHeaderField: "ETag")
+                contentType: payload.contentType,
+                etag: http.value(forHTTPHeaderField: "ETag"),
+                sourceSize: upstreamBody.count
             )
         }
 

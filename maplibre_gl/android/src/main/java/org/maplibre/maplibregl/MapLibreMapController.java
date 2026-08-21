@@ -370,6 +370,26 @@ final class MapLibreMapController
     }
   }
 
+  /** Converts the property map for a supported runtime layer type. */
+  @Nullable
+  private PropertyValue[] interpretLayerProperties(
+      @NonNull Layer layer, @Nullable Object properties) {
+    if (layer instanceof LineLayer) {
+      return LayerPropertyConverter.interpretLineLayerProperties(properties);
+    } else if (layer instanceof FillLayer) {
+      return LayerPropertyConverter.interpretFillLayerProperties(properties);
+    } else if (layer instanceof CircleLayer) {
+      return LayerPropertyConverter.interpretCircleLayerProperties(properties);
+    } else if (layer instanceof SymbolLayer) {
+      return LayerPropertyConverter.interpretSymbolLayerProperties(properties);
+    } else if (layer instanceof RasterLayer) {
+      return LayerPropertyConverter.interpretRasterLayerProperties(properties);
+    } else if (layer instanceof HillshadeLayer) {
+      return LayerPropertyConverter.interpretHillshadeLayerProperties(properties);
+    }
+    return null;
+  }
+
   private void updateLocationComponentLayer() {
     if (locationComponent != null && locationComponentRequiresUpdate()) {
       locationComponent.applyStyle(buildLocationComponentOptions(style));
@@ -1489,37 +1509,70 @@ final class MapLibreMapController
           Layer layer = style.getLayer(layerId);
 
           if (layer != null) {
-            final PropertyValue[] properties;
-
-            if (layer instanceof LineLayer) {
-              properties = LayerPropertyConverter
-                  .interpretLineLayerProperties(call.argument("properties"));
-            } else if (layer instanceof FillLayer) {
-              properties = LayerPropertyConverter
-                  .interpretFillLayerProperties(call.argument("properties"));
-            } else if (layer instanceof CircleLayer) {
-              properties = LayerPropertyConverter
-                  .interpretCircleLayerProperties(call.argument("properties"));
-            } else if (layer instanceof SymbolLayer) {
-              properties = LayerPropertyConverter
-                  .interpretSymbolLayerProperties(call.argument("properties"));
-            } else if (layer instanceof RasterLayer) {
-              properties = LayerPropertyConverter
-                  .interpretRasterLayerProperties(call.argument("properties"));
-            } else if (layer instanceof HillshadeLayer) {
-              properties = LayerPropertyConverter
-                  .interpretHillshadeLayerProperties(call.argument("properties"));
-            } else {
+            final Object propertyMap = call.argument("properties");
+            final PropertyValue[] properties = interpretLayerProperties(layer, propertyMap);
+            if (properties == null) {
               result.error("UNSUPPORTED_LAYER_TYPE", "Layer type not supported", null);
               return;
             }
             layer.setProperties(properties);
-            applyRasterOpacityTransition(layer, call.argument("properties"));
+            applyRasterOpacityTransition(layer, propertyMap);
             result.success(null);
           } else {
             result.error("LAYER_NOT_FOUND_ERROR", "Layer " + layerId + "not found", null);
           }
 
+          break;
+        }
+        case "layer#setPropertiesBatch": {
+          if (style == null || !style.isFullyLoaded()) {
+            result.error(
+                "STYLE_NOT_READY",
+                "Style is null or not fully loaded. Has onStyleLoaded() already been invoked?",
+                null);
+            break;
+          }
+
+          final List<Map<String, Object>> updates = call.argument("updates");
+          if (updates == null) {
+            result.error("INVALID_ARGUMENT", "updates is required", null);
+            break;
+          }
+
+          // Validate and convert the whole batch before mutating any layer. A
+          // bad target must not leave a frame transition half applied.
+          final List<Layer> layers = new ArrayList<>(updates.size());
+          final List<PropertyValue[]> converted = new ArrayList<>(updates.size());
+          final List<Object> propertyMaps = new ArrayList<>(updates.size());
+          for (Map<String, Object> update : updates) {
+            final Object layerIdValue = update.get("layerId");
+            if (!(layerIdValue instanceof String)) {
+              result.error("INVALID_ARGUMENT", "Every update needs a layerId", null);
+              return;
+            }
+            final String layerId = (String) layerIdValue;
+            final Layer layer = style.getLayer(layerId);
+            if (layer == null) {
+              result.error("LAYER_NOT_FOUND_ERROR", "Layer " + layerId + " not found", null);
+              return;
+            }
+            final Object propertyMap = update.get("properties");
+            final PropertyValue[] properties = interpretLayerProperties(layer, propertyMap);
+            if (properties == null) {
+              result.error("UNSUPPORTED_LAYER_TYPE", "Layer type not supported", null);
+              return;
+            }
+            layers.add(layer);
+            converted.add(properties);
+            propertyMaps.add(propertyMap);
+          }
+
+          for (int i = 0; i < layers.size(); i++) {
+            final Layer layer = layers.get(i);
+            layer.setProperties(converted.get(i));
+            applyRasterOpacityTransition(layer, propertyMaps.get(i));
+          }
+          result.success(null);
           break;
         }
       case "fillLayer#add":

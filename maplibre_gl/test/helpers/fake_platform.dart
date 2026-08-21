@@ -393,6 +393,13 @@ class FakeMapLibrePlatform extends MapLibrePlatform {
   }
 
   @override
+  Future<void> setLayerPropertiesBatch(
+    List<Map<String, dynamic>> updates,
+  ) async {
+    calls.add(PlatformCall('setLayerPropertiesBatch', [updates]));
+  }
+
+  @override
   Future<void> addCircleLayer(
     String sourceId,
     String layerId,

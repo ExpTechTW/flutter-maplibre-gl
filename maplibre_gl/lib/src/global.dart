@@ -73,7 +73,49 @@ Future<void> setHttpHeaders(Map<String, String> headers) {
   );
 }
 
-const _tileCacheChannel = MethodChannel('plugins.flutter.io/maplibre_gl/tile_cache');
+const _tileCacheChannel = MethodChannel(
+  'plugins.flutter.io/maplibre_gl/tile_cache',
+);
+
+/// Compact tile-channel token for the one body that occurs under many URLs.
+///
+/// StandardMessageCodec encodes this integer in about five bytes. Shipping the
+/// equivalent 68-byte PNG for every empty radar tile also copies that payload
+/// through the Dart heap and the platform channel each time. Native expands the
+/// token to its process-wide immutable byte array before MapLibre sees it.
+const int _transparentRgbaPngWireToken = 1;
+
+// False until native explicitly advertises the same token. This keeps a Dart
+// hot reload compatible with an older Android/iOS binary: it receives the full
+// Uint8List it already understands instead of silently dropping `data: 1`.
+bool _nativeSupportsTransparentRgbaPngToken = false;
+
+final Uint8List _transparentRgbaPng = base64Decode(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUA'
+  'AXpeqz8AAAAASUVORK5CYII=',
+);
+
+bool _sameBytes(Uint8List left, Uint8List right) {
+  if (left.length != right.length) return false;
+  for (var i = 0; i < left.length; i++) {
+    if (left[i] != right[i]) return false;
+  }
+  return true;
+}
+
+Object _tileDataToWire(Uint8List data) =>
+    _nativeSupportsTransparentRgbaPngToken &&
+            _sameBytes(data, _transparentRgbaPng)
+        ? _transparentRgbaPngWireToken
+        : data;
+
+Uint8List? _tileDataFromWire(Object? raw) => switch (raw) {
+  final int token when token == _transparentRgbaPngWireToken =>
+    _transparentRgbaPng,
+  final Uint8List data => data,
+  final List<int> data => Uint8List.fromList(data),
+  _ => null,
+};
 
 /// One cached tile body plus the response metadata needed to replay it.
 ///
@@ -85,6 +127,7 @@ class MapLibreTile {
     required this.data,
     this.contentType,
     this.etag,
+    this.sourceSize,
   });
 
   final String url;
@@ -92,9 +135,15 @@ class MapLibreTile {
   final String? contentType;
   final String? etag;
 
+  /// Original network-body size before native canonicalised a placeholder.
+  ///
+  /// Present only on native-to-Dart writes. Cache reads and injections leave it
+  /// null because they do not represent newly downloaded traffic.
+  final int? sourceSize;
+
   Map<String, Object?> _toWire() => <String, Object?>{
     'url': url,
-    'data': data,
+    'data': _tileDataToWire(data),
     if (contentType != null) 'contentType': contentType,
     if (etag != null) 'etag': etag,
   };
@@ -133,20 +182,20 @@ Future<void> bindMapLibreTileCache({
       case 'cacheablePatterns':
         return cacheablePatterns;
       case 'getBatch':
-        final args = Map<String, Object?>.from(call.arguments as Map);
-        final urls = (args['urls'] as List).cast<String>();
+        final args = Map<String, Object?>.from(call.arguments! as Map);
+        final urls = (args['urls']! as List).cast<String>();
         final hits = await getBatch(urls);
         return <String, Object?>{
           for (final hit in hits)
             hit.url: <String, Object?>{
-              'data': hit.data,
+              'data': _tileDataToWire(hit.data),
               'contentType': hit.contentType,
               'etag': hit.etag,
             },
         };
       case 'putBatch':
-        final args = Map<String, Object?>.from(call.arguments as Map);
-        final entries = (args['entries'] as List).cast<Object?>();
+        final args = Map<String, Object?>.from(call.arguments! as Map);
+        final entries = (args['entries']! as List).cast<Object?>();
         await putBatch([
           for (final entry in entries)
             if (_tileFromWire(entry) case final tile?) tile,
@@ -165,19 +214,15 @@ MapLibreTile? _tileFromWire(Object? entry) {
   if (entry is! Map) return null;
   final row = Map<Object?, Object?>.from(entry);
   final url = row['url'];
-  final raw = row['data'];
   if (url is! String) return null;
-  final Uint8List? data = switch (raw) {
-    Uint8List u => u,
-    List<int> l => Uint8List.fromList(l),
-    _ => null,
-  };
+  final data = _tileDataFromWire(row['data']);
   if (data == null) return null;
   return MapLibreTile(
     url: url,
     data: data,
     contentType: row['contentType'] as String?,
     etag: row['etag'] as String?,
+    sourceSize: row['sourceSize'] as int?,
   );
 }
 
@@ -211,7 +256,9 @@ Future<TileMemoryUsage?> injectMapLibreTiles(List<MapLibreTile> tiles) async {
   try {
     final result = await _tileCacheChannel.invokeMethod<Map<Object?, Object?>>(
       'injectTiles',
-      {'entries': [for (final tile in tiles) tile._toWire()]},
+      {
+        'entries': [for (final tile in tiles) tile._toWire()],
+      },
     );
     if (result == null) return null;
     return TileMemoryUsage(
@@ -262,11 +309,26 @@ Future<void> _setCacheablePatterns(List<String> patterns) async {
 /// MapLibre's own ambient/offline database.
 Future<void> setMapLibreTileMemoryLimit(int bytes) async {
   try {
-    await _tileCacheChannel.invokeMethod<void>('setMemoryLimit', {
-      'bytes': bytes,
-    });
+    final response = await _tileCacheChannel
+        .invokeMethod<Map<Object?, Object?>>('setMemoryLimit', {
+          'bytes': bytes,
+          // Native also gates its outbound token on this declaration, so a
+          // newer native library remains compatible with older Dart code.
+          'wireTokens': const [_transparentRgbaPngWireToken],
+        });
+    final tokens = response?['wireTokens'];
+    _nativeSupportsTransparentRgbaPngToken =
+        tokens is List && tokens.contains(_transparentRgbaPngWireToken);
+    if (kDebugMode) {
+      debugPrint(
+        'MapLibre tile wire: '
+        '${_nativeSupportsTransparentRgbaPngToken ? 'token-1' : 'raw-bytes'}',
+      );
+    }
   } catch (_) {
     // Plugin not attached / binding not ready (tests, early bootstrap).
+    _nativeSupportsTransparentRgbaPngToken = false;
+    if (kDebugMode) debugPrint('MapLibre tile wire: raw-bytes (unavailable)');
   }
 }
 

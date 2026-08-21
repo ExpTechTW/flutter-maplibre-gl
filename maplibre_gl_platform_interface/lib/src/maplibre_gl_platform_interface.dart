@@ -128,6 +128,9 @@ abstract class MapLibrePlatform {
   /// sources, tiles) intact. Pausing a hidden map (e.g. an offstage tab in an
   /// `IndexedStack`) stops its native frame production so it stops burning GPU;
   /// the map resumes exactly where it was.
+  ///
+  /// On iOS, a resume completes after the first newly rendered frame and throws
+  /// on a bounded timeout so the caller can recover a stuck platform view.
   Future<void> setRenderPaused(bool paused);
 
   /// Forces the map to use online mode (disables offline mode).
@@ -334,6 +337,15 @@ abstract class MapLibrePlatform {
   Future<void> setLayerProperties(
     String layerId,
     Map<String, dynamic> properties,
+  );
+
+  /// Applies several layer-property changes in one platform call.
+  ///
+  /// Each update contains a `layerId` and its `properties`. Native platforms
+  /// validate the complete batch before applying it so callers never observe a
+  /// partially-applied frame transition.
+  Future<void> setLayerPropertiesBatch(
+    List<Map<String, dynamic>> updates,
   );
 
   Future<void> addCircleLayer(

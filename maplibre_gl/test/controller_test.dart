@@ -224,6 +224,35 @@ void main() {
       expect(calls.first.positionalArgs[1], false);
     });
 
+    test('setLayerPropertiesBatch delegates one sparse batch', () async {
+      await controller.setLayerPropertiesBatch(
+        const [
+          (
+            layerId: 'old-frame',
+            properties: RasterLayerProperties(rasterOpacity: 0),
+          ),
+          (
+            layerId: 'new-frame',
+            properties: RasterLayerProperties(rasterOpacity: 0.85),
+          ),
+        ],
+        skipNulls: true,
+      );
+
+      final calls = platform.callsFor('setLayerPropertiesBatch');
+      expect(calls, hasLength(1));
+      expect(calls.single.positionalArgs.single, [
+        {
+          'layerId': 'old-frame',
+          'properties': {'raster-opacity': 0.0},
+        },
+        {
+          'layerId': 'new-frame',
+          'properties': {'raster-opacity': 0.85},
+        },
+      ]);
+    });
+
     test('addImageLayer delegates to addLayer on platform', () async {
       await controller.addImageLayer('img-layer', 'img-source');
 

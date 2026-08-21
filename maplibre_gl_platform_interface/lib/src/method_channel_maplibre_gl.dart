@@ -852,6 +852,16 @@ class MapLibreMethodChannel extends MapLibrePlatform {
   }
 
   @override
+  Future<void> setLayerPropertiesBatch(
+    List<Map<String, dynamic>> updates,
+  ) async {
+    if (updates.isEmpty) return;
+    await _channel.invokeMethod('layer#setPropertiesBatch', <String, dynamic>{
+      'updates': updates,
+    });
+  }
+
+  @override
   Future<void> addCircleLayer(
     String sourceId,
     String layerId,

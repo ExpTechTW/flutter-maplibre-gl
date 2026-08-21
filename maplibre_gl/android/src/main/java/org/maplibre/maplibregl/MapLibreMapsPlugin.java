@@ -64,7 +64,7 @@ public class MapLibreMapsPlugin implements FlutterPlugin, ActivityAware {
 
   @Override
   public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
-    // no-op
+    MapLibreDartTileBridge.detach(binding.getBinaryMessenger());
   }
 
   @Override

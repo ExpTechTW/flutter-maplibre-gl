@@ -248,8 +248,27 @@ abstract class MapLibreHttpRequestUtil {
     // URLs are served `immutable` so a cached error is never revalidated away.
     if (response.code() == 200 && response.body() != null) {
       ResponseBody body = response.body();
-      long contentLength = body.contentLength();
-      if (contentLength >= 0 && contentLength <= MAX_PUT_BYTES) {
+      // Bound by the bytes that are actually here, never by what the server
+      // declared. `contentLength()` is -1 whenever the length is unknown: a
+      // chunked response, and every response OkHttp's own bridge interceptor
+      // transparently gunzipped — it drops Content-Length along with the
+      // encoding. The gate used to be `contentLength >= 0 && <= MAX`, so every
+      // one of those tiles was skipped here. MapLibre still drew them, because
+      // the body is handed back either way, but they never entered `mem` and
+      // never reached Dart, and `filterMissing` therefore reported them absent
+      // for the rest of the session. A settled timeline frame gates its reveal
+      // on exactly that probe, so the frame never became display-ready: on
+      // Android the map kept drawing the previous timestamp after every scrub,
+      // and the store never learned the tile, so returning re-downloaded it.
+      //
+      // iOS gates on its buffered body's own length instead
+      // (MapLibreHeadersProtocol.swift), which is why only Android stalled.
+      //
+      // Buffering an unknown-length body is bounded in practice: only
+      // `isCacheableUrl` URLs reach this line — tiles, glyph ranges, small
+      // images — and the real length is still checked before anything is kept.
+      long declared = body.contentLength();
+      if (declared <= MAX_PUT_BYTES) {
         byte[] bytes = body.bytes();
         // Double insurance: as an application interceptor the body should
         // already be inflated (OkHttp's bridge gunzips before it reaches us),
@@ -258,10 +277,28 @@ abstract class MapLibreHttpRequestUtil {
         if ("gzip".equalsIgnoreCase(response.header("Content-Encoding"))) {
           bytes = gunzip(bytes);
         }
-        MapLibreDartTileBridge.put(
-            url, bytes, response.header("Content-Type"), response.header("ETag"));
+        MediaType mediaType = body.contentType();
+        // An unknown length can still turn out to be too big to keep. Measure
+        // it now that it is buffered, and store only what fits.
+        if (bytes.length <= MAX_PUT_BYTES) {
+          int sourceSize = bytes.length;
+          MapLibreDartTileBridge.NormalizedPayload payload =
+              MapLibreDartTileBridge.normalizeRasterPayload(
+                  bytes, response.header("Content-Type"));
+          bytes = payload.data;
+          MapLibreDartTileBridge.put(
+              url, bytes, payload.contentType, response.header("ETag"), sourceSize);
+          if (payload.repaired) {
+            mediaType = MediaType.parse("image/png");
+            if (payload.contentType != null) {
+              rebuilt.header("Content-Type", payload.contentType);
+            }
+          }
+        }
+        // The body was consumed to measure it, so it has to be handed back
+        // whether or not it was stored.
         rebuilt
-            .body(ResponseBody.create(bytes, body.contentType()))
+            .body(ResponseBody.create(bytes, mediaType))
             .header("Content-Length", String.valueOf(bytes.length));
       }
     }

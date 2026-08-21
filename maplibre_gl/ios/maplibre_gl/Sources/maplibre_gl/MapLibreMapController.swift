@@ -33,6 +33,9 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     private var userFps: MLNMapViewPreferredFramesPerSecond = .default
     private var pausedByDart = false
     private var isBackgroundPaused = false
+    private var pendingRenderResume: FlutterResult?
+    private var renderResumeTimeout: DispatchWorkItem?
+    private var renderResumeAttempt = 0
 
     func view() -> UIView {
         return mapView
@@ -50,6 +53,9 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         // Drive the view out of its window and drop the remaining references so
         // the engine is reclaimed promptly when the platform view is removed.
         NotificationCenter.default.removeObserver(self)
+        renderResumeTimeout?.cancel()
+        renderResumeTimeout = nil
+        pendingRenderResume = nil
         channel?.setMethodCallHandler(nil)
         mapView.delegate = nil
         if let recognizers = mapView.gestureRecognizers {
@@ -238,6 +244,11 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     /// leaves the link alive to be raised again.
     private static let pausedFps = MLNMapViewPreferredFramesPerSecond(rawValue: 1)
 
+    /// Wakes a resuming view makes before it is declared stuck, and the gap
+    /// between them. Their product is the budget the old single timeout used.
+    private static let renderResumeAttempts = 3
+    private static let renderResumeInterval = 0.5
+
     // Pausing the render loop before the OS suspends the process prevents a
     // SIGSEGV in PMTilesFileSource, which runs file I/O on a background thread
     // that can be torn down mid-read during app backgrounding (#833).
@@ -252,12 +263,170 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         isBackgroundPaused = false
         guard !pausedByDart else { return }
         mapView.preferredFramesPerSecond = userFps
+        wakeMapView()
+    }
+
+    /// Makes a retained `MLNMapView` produce a fresh IOSurface frame.
+    ///
+    /// Flutter keeps iOS platform views mounted while an IndexedStack tab is
+    /// hidden. Raising `preferredFramesPerSecond` alone only retimes MapLibre's
+    /// display link; it does not dirty the renderer, so Flutter can keep
+    /// compositing the last native framebuffer after the tab returns. A public
+    /// `triggerRepaint()` is the authoritative way to request new MapLibre work.
+    /// The second request runs after Flutter has applied the visibility edge.
+    private func wakeMapView() {
+        mapView.setNeedsLayout()
+        mapView.layoutIfNeeded()
+        mapView.triggerRepaint()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self,
+                  !self.pausedByDart,
+                  !self.isBackgroundPaused
+            else { return }
+            self.mapView.triggerRepaint()
+        }
+    }
+
+    /// Completes `map#resume` only after MapLibre confirms that a frame was
+    /// rendered. This turns a previously silent stuck renderer into a bounded,
+    /// recoverable platform error for the Flutter owner.
+    private func waitForRenderResume(result: @escaping FlutterResult) {
+        if let pending = pendingRenderResume {
+            renderResumeTimeout?.cancel()
+            pendingRenderResume = nil
+            pending(
+                FlutterError(
+                    code: "map_resume_superseded",
+                    message: "A newer map resume replaced the pending request.",
+                    details: nil
+                )
+            )
+        }
+
+        pendingRenderResume = result
+        renderResumeAttempt = 0
+        scheduleRenderResumeAttempt()
+    }
+
+    /// Wakes the view, then waits [renderResumeInterval] for it to answer.
+    ///
+    /// A single wake is not evidence either way. The paused link ticks once a
+    /// second, and the visibility edge that triggered this resume is followed by
+    /// a layout pass that has not necessarily run yet, so the first
+    /// `triggerRepaint()` can easily land where nothing is there to act on it.
+    /// Reporting that as a stuck renderer made the Flutter owner throw the
+    /// platform view away and rebuild it — a style reload and every layer
+    /// remounted — on a map that was about to draw by itself.
+    ///
+    /// The attempts share the budget the single timeout used to have, so a view
+    /// that really is stuck is still reported just as quickly as before.
+    private func scheduleRenderResumeAttempt() {
+        guard pendingRenderResume != nil else { return }
+        renderResumeAttempt += 1
+        wakeMapView()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.pendingRenderResume != nil else { return }
+            self.renderResumeTimeout = nil
+            if self.renderResumeAttempt < MapLibreMapController.renderResumeAttempts {
+                self.scheduleRenderResumeAttempt()
+            } else {
+                self.failRenderResume()
+            }
+        }
+        renderResumeTimeout = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + MapLibreMapController.renderResumeInterval,
+            execute: work
+        )
+    }
+
+    private func failRenderResume() {
+        guard let pending = pendingRenderResume else { return }
+        pendingRenderResume = nil
+        renderResumeTimeout = nil
+        renderResumeAttempt = 0
+        pending(
+            FlutterError(
+                code: "map_resume_timeout",
+                message: "MapLibre did not render a frame after resume.",
+                details: [
+                    "window": self.mapView.window != nil,
+                    "hidden": self.mapView.isHidden,
+                    "frame": NSCoder.string(for: self.mapView.frame),
+                ]
+            )
+        )
+    }
+
+    private func finishRenderResume() {
+        guard let result = pendingRenderResume else { return }
+        renderResumeTimeout?.cancel()
+        renderResumeTimeout = nil
+        renderResumeAttempt = 0
+        pendingRenderResume = nil
+        result(nil)
+    }
+
+    private func cancelRenderResume() {
+        guard let result = pendingRenderResume else { return }
+        renderResumeTimeout?.cancel()
+        renderResumeTimeout = nil
+        renderResumeAttempt = 0
+        pendingRenderResume = nil
+        result(
+            FlutterError(
+                code: "map_resume_cancelled",
+                message: "The map was paused before its resumed frame rendered.",
+                details: nil
+            )
+        )
     }
 
     func gestureRecognizer(
         _: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith _: UIGestureRecognizer
     ) -> Bool {
+        return true
+    }
+
+    private func supportsLayerProperties(_ layer: MLNStyleLayer) -> Bool {
+        switch layer {
+        case is MLNLineStyleLayer,
+             is MLNFillStyleLayer,
+             is MLNCircleStyleLayer,
+             is MLNSymbolStyleLayer,
+             is MLNRasterStyleLayer,
+             is MLNHillshadeStyleLayer:
+            return true
+        default:
+            return false
+        }
+    }
+
+    @discardableResult
+    private func applyLayerProperties(
+        _ properties: [String: Any],
+        to layer: MLNStyleLayer
+    ) -> Bool {
+        switch layer {
+        case let lineLayer as MLNLineStyleLayer:
+            LayerPropertyConverter.addLineProperties(lineLayer: lineLayer, properties: properties)
+        case let fillLayer as MLNFillStyleLayer:
+            LayerPropertyConverter.addFillProperties(fillLayer: fillLayer, properties: properties)
+        case let circleLayer as MLNCircleStyleLayer:
+            LayerPropertyConverter.addCircleProperties(circleLayer: circleLayer, properties: properties)
+        case let symbolLayer as MLNSymbolStyleLayer:
+            LayerPropertyConverter.addSymbolProperties(symbolLayer: symbolLayer, properties: properties)
+        case let rasterLayer as MLNRasterStyleLayer:
+            LayerPropertyConverter.addRasterProperties(rasterLayer: rasterLayer, properties: properties)
+        case let hillshadeLayer as MLNHillshadeStyleLayer:
+            LayerPropertyConverter.addHillshadeProperties(
+                hillshadeLayer: hillshadeLayer,
+                properties: properties
+            )
+        default:
+            return false
+        }
         return true
     }
 
@@ -435,15 +604,18 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
             // In MapLibre GL iOS, this is typically handled by the style and data sources
             result(nil)
         case "map#pause":
+            cancelRenderResume()
             pausedByDart = true
             mapView.preferredFramesPerSecond = MapLibreMapController.pausedFps
             result(nil)
         case "map#resume":
             pausedByDart = false
-            if !isBackgroundPaused {
-                mapView.preferredFramesPerSecond = userFps
+            guard !isBackgroundPaused else {
+                result(nil)
+                return
             }
-            result(nil)
+            mapView.preferredFramesPerSecond = userFps
+            waitForRenderResume(result: result)
         case "camera#ease":
             guard let arguments = methodCall.arguments as? [String: Any] else { 
                 result(false)
@@ -731,21 +903,7 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
                 return
             }
 
-            //switch depending on the runtime type of layer
-            switch layer {
-            case let lineLayer as MLNLineStyleLayer:
-                LayerPropertyConverter.addLineProperties(lineLayer: lineLayer, properties: properties)
-            case let fillLayer as MLNFillStyleLayer:
-                LayerPropertyConverter.addFillProperties(fillLayer: fillLayer, properties: properties)
-            case let circleLayer as MLNCircleStyleLayer:
-                LayerPropertyConverter.addCircleProperties(circleLayer: circleLayer, properties: properties)
-             case let symbolLayer as MLNSymbolStyleLayer:
-                LayerPropertyConverter.addSymbolProperties(symbolLayer: symbolLayer, properties: properties)
-            case let rasterLayer as MLNRasterStyleLayer:
-                LayerPropertyConverter.addRasterProperties(rasterLayer: rasterLayer, properties: properties)
-            case let hillshadeLayer as MLNHillshadeStyleLayer:
-                LayerPropertyConverter.addHillshadeProperties(hillshadeLayer: hillshadeLayer, properties: properties)
-            default:
+            guard applyLayerProperties(properties, to: layer) else {
                 result(FlutterError(
                     code: "UNSUPPORTED_LAYER_TYPE",
                     message: "Layer type not supported",
@@ -754,6 +912,57 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
                 return
             }
 
+            result(nil)
+
+        case "layer#setPropertiesBatch":
+            guard let arguments = methodCall.arguments as? [String: Any] else { return }
+            guard let updates = arguments["updates"] as? [[String: Any]] else { return }
+            guard let style = mapView.style else {
+                result(FlutterError(
+                    code: "STYLE_NOT_READY",
+                    message: "Style is null or not fully loaded.",
+                    details: nil
+                ))
+                return
+            }
+
+            // Resolve every target first so an invalid update cannot leave a
+            // frame transition half applied.
+            var resolved: [(layer: MLNStyleLayer, properties: [String: Any])] = []
+            resolved.reserveCapacity(updates.count)
+            for update in updates {
+                guard let layerId = update["layerId"] as? String,
+                      let properties = update["properties"] as? [String: Any]
+                else {
+                    result(FlutterError(
+                        code: "INVALID_ARGUMENT",
+                        message: "Every update needs a layerId and properties.",
+                        details: nil
+                    ))
+                    return
+                }
+                guard let layer = style.layer(withIdentifier: layerId) else {
+                    result(FlutterError(
+                        code: "LAYER_NOT_FOUND_ERROR",
+                        message: "Layer " + layerId + " not found",
+                        details: ""
+                    ))
+                    return
+                }
+                guard supportsLayerProperties(layer) else {
+                    result(FlutterError(
+                        code: "UNSUPPORTED_LAYER_TYPE",
+                        message: "Layer type not supported",
+                        details: ""
+                    ))
+                    return
+                }
+                resolved.append((layer, properties))
+            }
+
+            for update in resolved {
+                applyLayerProperties(update.properties, to: update.layer)
+            }
             result(nil)
 
         case "fillLayer#add":
@@ -1630,6 +1839,10 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         }
     }
 
+    func mapView(_: MLNMapView, didFinishRenderingFrame _: Bool) {
+        finishRenderResume()
+    }
+
     // handle missing images
     func mapView(_: MLNMapView, didFailToLoadImage name: String) -> UIImage? {
         return loadIconImage(name: name)
@@ -2090,6 +2303,12 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     }
 
     func mapViewDidBecomeIdle(_: MLNMapView) {
+        // Idle means every source has loaded and nothing is left to draw, which
+        // is exactly the state a resumed view reaches when it was already
+        // complete. Waiting only on `didFinishRenderingFrame` therefore reported
+        // a healthy static map as a stuck one: with nothing dirty, MapLibre has
+        // no reason to schedule the render pass that callback announces.
+        finishRenderResume()
         if let channel = channel {
             channel.invokeMethod("map#onIdle", arguments: [])
         }
