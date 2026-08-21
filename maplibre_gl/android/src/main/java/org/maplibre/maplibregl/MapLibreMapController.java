@@ -147,6 +147,7 @@ final class MapLibreMapController
   private boolean dragEnabled = true;
   private boolean featureTapsTriggersMapClick = false;
   private boolean mapViewStarted = false;
+  private boolean mapViewResumed = false;
 
   /**
    * Whether Dart asked for this map to stop rendering (map#pause).
@@ -1168,34 +1169,30 @@ final class MapLibreMapController
           // only stopped if it is currently running. Tile downloads continue,
           // so a hidden map can still warm its cache.
           //
-          // onStop(), NOT onPause(). With the OpenGL SurfaceView renderer this
+          // onStop(), not onPause(), is the operation that actually parks the
+          // renderer. With the OpenGL SurfaceView renderer this
           // plugin ships (android-sdk-opengl 13.3.0), MapView.onPause() calls
           // MapRenderer.onPause(), and SurfaceViewMapRenderer overrides that
           // with a body of nothing but super.onPause() — whose bytecode is a
           // bare `return`. The call that actually parks the render thread is
           // SurfaceViewMapRenderer.onStop() -> MapLibreSurfaceView.onPause() ->
           // RenderThread.onPause(), reachable only through MapView.onStop().
-          // So the previous onPause() here was a no-op and every "paused" map
-          // kept rendering.
+          // So the previous onPause()-only implementation was a no-op and every
+          // "paused" map kept rendering. pauseMapView still sends onPause first
+          // to keep the lifecycle pair symmetric, then sends the required stop.
           //
           // pausedByDart keeps this decision from being undone by the activity
           // lifecycle: onStart/onResume below would otherwise restart a map
           // Dart deliberately stopped, on the next app foreground.
           pausedByDart = true;
-          if (mapView != null && mapViewStarted) {
-            mapView.onStop();
-            mapViewStarted = false;
-          }
+          pauseMapView();
           result.success(null);
           break;
         }
       case "map#resume":
         {
           pausedByDart = false;
-          if (mapView != null && !mapViewStarted) {
-            mapView.onStart();
-            mapViewStarted = true;
-          }
+          resumeMapView();
           result.success(null);
           break;
         }
@@ -2335,11 +2332,7 @@ final class MapLibreMapController
     }
     methodChannel.setMethodCallHandler(null);
     // Properly cleanup MapView lifecycle before destroying
-    if (mapView != null && mapViewStarted) {
-      mapView.onPause();
-      mapView.onStop();
-      mapViewStarted = false;
-    }
+    pauseMapView();
     destroyMapViewIfNecessary();
     Lifecycle lifecycle = lifecycleProvider.getLifecycle();
     if (lifecycle != null) {
@@ -2472,24 +2465,7 @@ final class MapLibreMapController
     if (pausedByDart) {
       return;
     }
-    mapView.onResume();
-    if (myLocationEnabled) {
-      startListeningForLocationUpdates();
-    }
-    // Force a repaint to fix invisible map when returning from background.
-    // The runnable is dispatched after the message loop drains, by which time
-    // dispose() may have nulled mapView (e.g. a map hosted in a Dialog or
-    // BottomSheet that is dismissed mid-resume). Re-check disposed/mapView
-    // inside the runnable to mirror the guard at the top of onResume.
-    mapView.post(new Runnable() {
-      @Override
-      public void run() {
-        if (disposed || mapView == null) {
-          return;
-        }
-        mapView.invalidate();
-      }
-    });
+    resumeMapView();
   }
 
   @Override
@@ -2497,7 +2473,10 @@ final class MapLibreMapController
     if (disposed || mapView == null) {
       return;
     }
-    mapView.onPause();
+    if (mapViewResumed) {
+      mapView.onPause();
+      mapViewResumed = false;
+    }
   }
 
   @Override
@@ -2509,6 +2488,54 @@ final class MapLibreMapController
       mapView.onStop();
       mapViewStarted = false;
     }
+  }
+
+  /** Stops one map without depending on the Activity lifecycle to arrive afterwards. */
+  private void pauseMapView() {
+    if (mapView == null) {
+      return;
+    }
+    if (mapViewResumed) {
+      mapView.onPause();
+      mapViewResumed = false;
+    }
+    if (mapViewStarted) {
+      mapView.onStop();
+      mapViewStarted = false;
+    }
+  }
+
+  /** Restores the complete MapView lifecycle and forces the first returned frame. */
+  private void resumeMapView() {
+    final MapView view = mapView;
+    if (disposed || view == null) {
+      return;
+    }
+    if (!mapViewStarted) {
+      view.onStart();
+      mapViewStarted = true;
+    }
+    if (!mapViewResumed) {
+      view.onResume();
+      mapViewResumed = true;
+    }
+    if (myLocationEnabled) {
+      startListeningForLocationUpdates();
+    }
+    // Activity onResume used to be the only path that forced this repaint. When
+    // pausedByDart made that callback skip an off-screen map, map#resume only
+    // called onStart and the SurfaceView could remain blank until hot reload
+    // happened to schedule another frame.
+    view.post(
+        new Runnable() {
+          @Override
+          public void run() {
+            if (disposed || pausedByDart || mapView != view) {
+              return;
+            }
+            view.invalidate();
+          }
+        });
   }
 
   @Override
