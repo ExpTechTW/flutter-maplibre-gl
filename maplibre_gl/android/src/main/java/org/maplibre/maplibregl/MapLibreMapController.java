@@ -2376,7 +2376,8 @@ final class MapLibreMapController
             position.zoom,
             position.bearing,
             mapView.getWidth(),
-            mapView.getHeight()));
+            mapView.getHeight(),
+            context.getResources().getDisplayMetrics().density));
   }
 
   @Override

@@ -78,6 +78,9 @@ final class WindParticleLayer {
    */
   private static final int STATE_EDGE = 80;
 
+  /** The frame rate the advection curves were tuned at. See {@link #setPlaying}. */
+  private static final int TARGET_FPS = 60;
+
   // ---------------------------------------------------------------- shaders
 
   /**
@@ -340,23 +343,72 @@ final class WindParticleLayer {
   private float fieldLon0;
   private long frame;
 
+  /** The camera the surviving trail pixels were drawn for.
+   *
+   * The trail buffers live in SCREEN space, so the moment the camera moves
+   * every pixel in them is anchored to the wrong place on the map. The Flutter
+   * overlay this replaces dropped its buffer on any camera change; losing that
+   * in the port is what made pans and pinches smear the field behind the map
+   * until the fade caught up — and made the whole layer look displaced by
+   * exactly the distance travelled since the streaks were laid down.
+   */
+  private boolean haveTrailCam;
+  private double trailZoom;
+  private double trailLat;
+  private double trailLng;
+  private double trailBearing;
+
+  /** Set when the trails must be discarded: camera moved, or a new field landed. */
+  private boolean trailsDirty = true;
+
   /** Camera + viewport for one frame, snapshotted so the GL thread never blocks. */
   static final class CameraSnapshot {
     final double centerLat;
     final double centerLng;
     final double zoom;
     final double bearing;
+
+    /** Viewport in **physical** pixels — what the GL viewport and the trail
+     * textures are sized in. */
     final int width;
+
     final int height;
 
+    /**
+     * Display density, the bridge between the two pixel spaces in play.
+     *
+     * <p>MapLibre's zoom is defined against logical pixels: at zoom z the world
+     * is {@code 512 * 2^z} of them. An Android {@code View}'s width is physical.
+     * Projecting one against the other scales the whole field by the density —
+     * 2.625 on a Pixel 9 — which looks like the wind blowing over the wrong
+     * part of the map rather than like a unit bug.
+     */
+    final double density;
+
     CameraSnapshot(
-        double centerLat, double centerLng, double zoom, double bearing, int width, int height) {
+        double centerLat,
+        double centerLng,
+        double zoom,
+        double bearing,
+        int width,
+        int height,
+        double density) {
       this.centerLat = centerLat;
       this.centerLng = centerLng;
       this.zoom = zoom;
       this.bearing = bearing;
       this.width = width;
       this.height = height;
+      this.density = density <= 0 ? 1 : density;
+    }
+
+    /** Viewport half-size in logical pixels — the space {@code u_world} is in. */
+    double halfWidth() {
+      return width / density / 2;
+    }
+
+    double halfHeight() {
+      return height / density / 2;
     }
   }
 
@@ -504,6 +556,12 @@ final class WindParticleLayer {
       // CONTINUOUS is what keeps frames coming; without it the map only redraws
       // when something changed and the animation stops between gestures.
       mapView.setRenderingRefreshMode(MapRenderer.RenderingRefreshMode.CONTINUOUS);
+      // The integrator advances once per FRAME, not per second, so the frame
+      // rate is part of the tuning. Left uncapped the render thread free-runs —
+      // measured at 237 fps on a 120 Hz panel — and the wind blows at four
+      // times the speed it was tuned for. 60 is the rate the curves in
+      // wind_particle_sim.dart were fitted at.
+      mapView.setMaximumFps(TARGET_FPS);
       Log.i(TAG, "playing: continuous rendering on, first arm from the platform thread");
       arm();
     } else {
@@ -521,6 +579,9 @@ final class WindParticleLayer {
 
   void setField(FieldUpload upload) {
     pendingField = upload;
+    // A new forecast is new weather: streaks laid down by the previous one do
+    // not describe what is about to animate.
+    trailsDirty = true;
     arm();
   }
 
@@ -602,6 +663,7 @@ final class WindParticleLayer {
     }
     if (contextLost()) {
       deleteGlObjects();
+      trailsDirty = true;
     }
     if (quadProgram == 0 && !createGlObjects()) {
       return;
@@ -614,7 +676,32 @@ final class WindParticleLayer {
     if (!fieldReady) {
       return;
     }
+    // A paused layer draws nothing at all: compositing the frozen trails on
+    // every interaction redraw painted ghosts anchored to a camera that has
+    // since moved. Consuming the pending field above keeps it warm for the
+    // next play; resuming clears the trails because the camera is compared
+    // per drawn frame, and any movement during the pause marks them dirty.
+    if (!playing) {
+      return;
+    }
     ensureScreenTextures(cam.width, cam.height);
+
+    // Screen-space trails are only valid for the camera they were laid down
+    // with. Sub-pixel thresholds: below them the offset is invisible, above
+    // them every streak in the buffer points somewhere nobody sees.
+    boolean cameraMoved = haveTrailCam
+        && (Math.abs(cam.zoom - trailZoom) > 1e-4
+            || Math.abs(cam.centerLat - trailLat) > 1e-6
+            || Math.abs(cam.centerLng - trailLng) > 1e-6
+            || Math.abs(cam.bearing - trailBearing) > 0.05);
+    if (cameraMoved) {
+      trailsDirty = true;
+    }
+    haveTrailCam = true;
+    trailZoom = cam.zoom;
+    trailLat = cam.centerLat;
+    trailLng = cam.centerLng;
+    trailBearing = cam.bearing;
 
     GlState saved = GlState.capture();
     try {
@@ -685,11 +772,27 @@ final class WindParticleLayer {
         screenTex[1 - screenFront],
         0);
     GLES20.glViewport(0, 0, screenWidth, screenHeight);
-    GLES20.glUseProgram(quadProgram);
-    bindQuad(quadProgram);
-    bindTexture(GLES20.GL_TEXTURE2, screenTex[screenFront], quadProgram, "u_screen", 2);
-    uniform1f(quadProgram, "u_opacity", t.fadeOpacity(cam.zoom));
-    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+    if (trailsDirty) {
+      // Both textures, not just the one about to be drawn into — otherwise the
+      // swap hands the ghosts to the other buffer and they come right back.
+      for (int i = 0; i < 2; i++) {
+        GLES20.glFramebufferTexture2D(
+            GLES20.GL_FRAMEBUFFER,
+            GLES20.GL_COLOR_ATTACHMENT0,
+            GLES20.GL_TEXTURE_2D,
+            screenTex[i],
+            0);
+        GLES20.glClearColor(0f, 0f, 0f, 0f);
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+      }
+      trailsDirty = false;
+    } else {
+      GLES20.glUseProgram(quadProgram);
+      bindQuad(quadProgram);
+      bindTexture(GLES20.GL_TEXTURE2, screenTex[screenFront], quadProgram, "u_screen", 2);
+      uniform1f(quadProgram, "u_opacity", t.fadeOpacity(cam.zoom));
+      GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+    }
 
     // --- draw pass: this frame's particles on top of the faded streaks
     GLES20.glEnable(GLES20.GL_BLEND);
@@ -744,6 +847,14 @@ final class WindParticleLayer {
               + screenHeight
               + " zoom="
               + cam.zoom
+              + " density="
+              + cam.density
+              + " halfLogical="
+              + (float) cam.halfWidth()
+              + "x"
+              + (float) cam.halfHeight()
+              + " fpsCap="
+              + TARGET_FPS
               + " glError="
               + GLES20.glGetError());
     } else if (frame % 600 == 0) {
@@ -760,7 +871,7 @@ final class WindParticleLayer {
     double r = -cam.bearing * Math.PI / 180;
     uniform1f(program, "u_world", (float) world);
     uniform2f(program, "u_center", (float) cx, (float) cy);
-    uniform2f(program, "u_half", cam.width / 2f, cam.height / 2f);
+    uniform2f(program, "u_half", (float) cam.halfWidth(), (float) cam.halfHeight());
     uniform2f(program, "u_rot", (float) Math.cos(r), (float) Math.sin(r));
     uniform1f(program, "u_lon0", fieldLon0);
     uniform2f(program, "u_lat", fieldLat0, fieldLatSpan);
@@ -778,8 +889,8 @@ final class WindParticleLayer {
     double r = -cam.bearing * Math.PI / 180;
     double cosR = Math.cos(r);
     double sinR = Math.sin(r);
-    double hw = cam.width / 2.0;
-    double hh = cam.height / 2.0;
+    double hw = cam.halfWidth();
+    double hh = cam.halfHeight();
     double minX = Double.MAX_VALUE;
     double minY = Double.MAX_VALUE;
     double maxX = -Double.MAX_VALUE;
@@ -882,6 +993,9 @@ final class WindParticleLayer {
         GLES20.glDeleteTextures(1, screenTex, i);
       }
       screenTex[i] = createTexture(GLES20.GL_NEAREST);
+      // Zeroed, not left undefined: the first fade pass samples this texture
+      // and composites the result over the map, so uninitialised contents are
+      // driver-dependent garbage painted across the whole viewport.
       GLES20.glTexImage2D(
           GLES20.GL_TEXTURE_2D,
           0,
@@ -891,10 +1005,11 @@ final class WindParticleLayer {
           0,
           GLES20.GL_RGBA,
           GLES20.GL_UNSIGNED_BYTE,
-          null);
+          ByteBuffer.wrap(new byte[width * height * 4]));
     }
     screenWidth = width;
     screenHeight = height;
+    trailsDirty = true;
   }
 
   /**
@@ -984,6 +1099,8 @@ final class WindParticleLayer {
     screenHeight = 0;
     fieldReady = false;
     glContext = null;
+    haveTrailCam = false;
+    trailsDirty = true;
   }
 
   private void bindQuad(int program) {
