@@ -138,6 +138,8 @@ final class MapLibreMapController
   private FrameLayout mapViewContainer;
   private MapView mapView;
   private MapLibreMap mapLibreMap;
+  /** GPU wind field drawn inside the map's own GL surface; null until Dart asks. */
+  @Nullable private WindParticleLayer windParticleLayer;
   private boolean trackCameraPosition = false;
   private boolean myLocationEnabled = false;
   private int myLocationTrackingMode = 0;
@@ -1151,6 +1153,104 @@ final class MapLibreMapController
       case "map#getTelemetryEnabled":
         {
           result.success(false);
+          break;
+        }
+      case "windLayer#add":
+        {
+          // The particles are map content, not an overlay: drawn in the map's
+          // own GL surface they cost Flutter no frame at all, which on Android
+          // is the difference between working and being killed by lmkd (see
+          // WindParticleLayer's class comment).
+          if (windParticleLayer == null && mapView != null) {
+            WindParticleLayer layer = new WindParticleLayer(mapView);
+            if (layer.attach()) {
+              windParticleLayer = layer;
+            } else {
+              result.error(
+                  "WIND_LAYER_UNAVAILABLE",
+                  "the map is not on the SurfaceView renderer; wind particles need "
+                      + "textureMode off",
+                  null);
+              break;
+            }
+          }
+          result.success(null);
+          break;
+        }
+      case "windLayer#setTuning":
+        {
+          WindParticleLayer layer = windParticleLayer;
+          if (layer != null) {
+            WindParticleLayer.Tuning t = new WindParticleLayer.Tuning();
+            t.zoomLo = call.argument("zoomLo");
+            t.zoomHi = call.argument("zoomHi");
+            t.particlesLo = call.argument("particlesLo");
+            t.particlesHi = call.argument("particlesHi");
+            t.pointSizeLo = call.argument("pointSizeLo");
+            t.pointSizeHi = call.argument("pointSizeHi");
+            t.speedFactorLo = call.argument("speedFactorLo");
+            t.speedFactorHi = call.argument("speedFactorHi");
+            t.fadeOpacityLo = call.argument("fadeOpacityLo");
+            t.fadeOpacityHi = call.argument("fadeOpacityHi");
+            t.dropRate = call.argument("dropRate");
+            t.densityCalm = call.argument("densityCalm");
+            t.densityStrong = call.argument("densityStrong");
+            t.speedScale = call.argument("speedScale");
+            t.pixelRatio = call.argument("pixelRatio");
+            layer.setTuning(t);
+          }
+          result.success(null);
+          break;
+        }
+      case "windLayer#setField":
+        {
+          WindParticleLayer layer = windParticleLayer;
+          if (layer != null) {
+            // The raw WND1 body, exactly as Dart received it. Dart already has
+            // a tested parser and hands over the header it read; parsing again
+            // here would be a second copy of the format to keep in step.
+            // The camera goes with it: a field can land before the map has
+            // reported any camera movement, and the renderer draws nothing
+            // until it has one.
+            pushWindCamera(layer);
+            layer.setField(
+                new WindParticleLayer.FieldUpload(
+                    call.argument("bytes"),
+                    call.argument("planeOffset"),
+                    call.argument("width"),
+                    call.argument("height"),
+                    ((Double) call.argument("lat0")).floatValue(),
+                    ((Double) call.argument("lon0")).floatValue(),
+                    ((Double) call.argument("dLat")).floatValue(),
+                    ((Double) call.argument("dLon")).floatValue(),
+                    ((Double) call.argument("uMin")).floatValue(),
+                    ((Double) call.argument("uMax")).floatValue(),
+                    ((Double) call.argument("vMin")).floatValue(),
+                    ((Double) call.argument("vMax")).floatValue()));
+          }
+          result.success(null);
+          break;
+        }
+      case "windLayer#setPlaying":
+        {
+          WindParticleLayer layer = windParticleLayer;
+          if (layer != null) {
+            boolean playing = Boolean.TRUE.equals(call.argument("playing"));
+            if (playing) {
+              pushWindCamera(layer);
+            }
+            layer.setPlaying(playing);
+          }
+          result.success(null);
+          break;
+        }
+      case "windLayer#remove":
+        {
+          if (windParticleLayer != null) {
+            windParticleLayer.release();
+            windParticleLayer = null;
+          }
+          result.success(null);
           break;
         }
       case "map#setMaximumFps":
@@ -2231,6 +2331,9 @@ final class MapLibreMapController
 
   @Override
   public void onCameraMove() {
+    // Before the early return: the wind field has to follow the camera whether
+    // or not Dart asked to be told about it.
+    pushWindCamera(windParticleLayer);
     if (!trackCameraPosition) {
       return;
     }
@@ -2241,11 +2344,39 @@ final class MapLibreMapController
 
   @Override
   public void onCameraIdle() {
+    pushWindCamera(windParticleLayer);
     final Map<String, Object> arguments = new HashMap<>(2);
     if (trackCameraPosition) {
       arguments.put("position", Convert.toJson(mapLibreMap.getCameraPosition()));
     }
     methodChannel.invokeMethod("camera#onIdle", arguments);
+  }
+
+  /**
+   * Hands the wind layer the camera and viewport for the next frame.
+   *
+   * <p>A snapshot rather than a read from the GL thread: {@code MapLibreMap} is
+   * not thread-safe, and the render thread must never block on the platform
+   * thread — that is the deadlock the whole design avoids. Pushing on move and
+   * on idle covers everything, because a camera that is not moving does not
+   * make the last snapshot stale.
+   */
+  private void pushWindCamera(@Nullable WindParticleLayer layer) {
+    if (layer == null || mapLibreMap == null || mapView == null) {
+      return;
+    }
+    CameraPosition position = mapLibreMap.getCameraPosition();
+    if (position == null || position.target == null) {
+      return;
+    }
+    layer.setCamera(
+        new WindParticleLayer.CameraSnapshot(
+            position.target.getLatitude(),
+            position.target.getLongitude(),
+            position.zoom,
+            position.bearing,
+            mapView.getWidth(),
+            mapView.getHeight()));
   }
 
   @Override
@@ -2331,6 +2462,10 @@ final class MapLibreMapController
       activeSnapshotter = null;
     }
     methodChannel.setMethodCallHandler(null);
+    if (windParticleLayer != null) {
+      windParticleLayer.release();
+      windParticleLayer = null;
+    }
     // Properly cleanup MapView lifecycle before destroying
     pauseMapView();
     destroyMapViewIfNecessary();
@@ -2564,7 +2699,24 @@ final class MapLibreMapController
 
   @Override
   public void onTrimMemory(int level) {
-    // Lifecycle methods already handle resource management
+    if (disposed || mapView == null) {
+      return;
+    }
+    // ComponentCallbacks.onLowMemory() is deprecated as of API 34 and is no
+    // longer delivered on modern Android — onTrimMemory replaced it. Leaving
+    // this empty meant the only implemented path (onLowMemory, above) was dead
+    // code and the map never reduced memory: a TRIM_MEMORY_RUNNING_CRITICAL
+    // measured on API 37 returned 0 bytes, with 341 MB still held in raster
+    // textures, and lmkd killed the process.
+    //
+    // RUNNING_MODERATE and below are advisory and arrive often; reacting to
+    // them would evict tiles the user is actively panning over. RUNNING_LOW is
+    // the first level that means the process is a candidate.
+    if (level < ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+      return;
+    }
+    Log.w(TAG, "onTrimMemory(" + level + "): telling MapView to reduce memory usage.");
+    mapView.onLowMemory();
   }
 
   // MapLibreMapOptionsSink methods

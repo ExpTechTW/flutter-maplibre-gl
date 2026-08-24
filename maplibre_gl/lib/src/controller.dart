@@ -1053,6 +1053,35 @@ class MapLibreMapController extends ChangeNotifier {
     return _maplibrePlatform.setRenderPaused(paused);
   }
 
+  /// Adds the GPU wind-particle field, drawn inside the map's own render pass.
+  ///
+  /// Throws a [PlatformException] with code `WIND_LAYER_UNAVAILABLE` when the
+  /// map is not on a renderer that can host it — on Android that means texture
+  /// mode is on, which happens when the platform view is composited as a
+  /// texture layer. Callers should fall back to their own overlay there rather
+  /// than treating it as fatal.
+  Future<void> addWindParticleLayer() =>
+      _maplibrePlatform.addWindParticleLayer();
+
+  /// Sets the zoom-dependent curves as their endpoints — see
+  /// [MapLibrePlatform.setWindParticleTuning].
+  Future<void> setWindParticleTuning(Map<String, double> tuning) =>
+      _maplibrePlatform.setWindParticleTuning(tuning);
+
+  /// Uploads one wind field: its raw WND1 body plus the header already parsed
+  /// from it. Call once per forecast frame, never per animation frame.
+  Future<void> setWindParticleField(Map<String, Object> field) =>
+      _maplibrePlatform.setWindParticleField(field);
+
+  /// Starts or stops the animation. Stopping returns the map to on-demand
+  /// rendering, so an idle wind layer costs nothing.
+  Future<void> setWindParticlePlaying(bool playing) =>
+      _maplibrePlatform.setWindParticlePlaying(playing);
+
+  /// Removes the layer and releases its GPU resources.
+  Future<void> removeWindParticleLayer() =>
+      _maplibrePlatform.removeWindParticleLayer();
+
   /// Forces the map to use online mode, disabling any offline functionality.
   ///
   /// This is useful for testing or when you want to ensure the map always

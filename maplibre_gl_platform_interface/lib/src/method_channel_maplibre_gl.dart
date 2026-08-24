@@ -2,6 +2,31 @@ part of '../maplibre_gl_platform_interface.dart';
 
 class MapLibreMethodChannel extends MapLibrePlatform {
   late MethodChannel _channel;
+  /// Route the map through Flutter's texture pipeline (Texture Layer Hybrid
+  /// Composition) instead of a virtual display.
+  ///
+  /// **Left false deliberately. Measured, not assumed.** Turning it on also
+  /// flips the native side to `textureMode(true)` ([MapLibreMapBuilder]) — the
+  /// two are one setting, because a texture layer cannot composite MapLibre's
+  /// default `MapLibreGLSurfaceView`. That trade loses more than it wins:
+  ///
+  ///  - MapLibre's own javadoc calls `textureMode(true)` a significant
+  ///    performance penalty that should not be used unless absolutely needed,
+  ///    and `TextureViewMapRenderer.setRenderingRefreshMode()` throws — so it
+  ///    also gives up `WHEN_DIRTY`, which is the SurfaceView renderer's default
+  ///    and MapLibre's only render-scheduling control.
+  ///  - Flutter's own position on the composition half is
+  ///    "There are no plans to improve TLHC performance currently."
+  ///    (flutter/flutter#183626). `ImageReaderSurfaceProducer.queueImage`
+  ///    drops frames by design once the queue passes two.
+  ///
+  /// Measured on a Pixel 9 / 120 Hz: pinch-zoom was no better than the virtual
+  /// display path, in a **profile** build, so this is not a debug artefact.
+  ///
+  /// Not to be confused with the engine's HCPP mode
+  /// (`io.flutter.embedding.android.EnableHcpp`), which composites the map as
+  /// its own SurfaceControl layer and *is* smooth — but leaks a full-screen
+  /// HardwareBuffer per frame on 3.47.x. See the app's AndroidManifest.
   static bool useHybridComposition = false;
 
   Future<dynamic> _handleMethodCall(MethodCall call) async {
@@ -283,6 +308,31 @@ class MapLibreMethodChannel extends MapLibrePlatform {
   @override
   Future<void> setRenderPaused(bool paused) async {
     await _channel.invokeMethod(paused ? 'map#pause' : 'map#resume');
+  }
+
+  @override
+  Future<void> addWindParticleLayer() async {
+    await _channel.invokeMethod('windLayer#add');
+  }
+
+  @override
+  Future<void> setWindParticleTuning(Map<String, double> tuning) async {
+    await _channel.invokeMethod('windLayer#setTuning', tuning);
+  }
+
+  @override
+  Future<void> setWindParticleField(Map<String, Object> field) async {
+    await _channel.invokeMethod('windLayer#setField', field);
+  }
+
+  @override
+  Future<void> setWindParticlePlaying(bool playing) async {
+    await _channel.invokeMethod('windLayer#setPlaying', {'playing': playing});
+  }
+
+  @override
+  Future<void> removeWindParticleLayer() async {
+    await _channel.invokeMethod('windLayer#remove');
   }
 
   @override

@@ -133,6 +133,39 @@ abstract class MapLibrePlatform {
   /// on a bounded timeout so the caller can recover a stuck platform view.
   Future<void> setRenderPaused(bool paused);
 
+  /// Adds the GPU wind-particle field to this map, drawn inside the map's own
+  /// render pass.
+  ///
+  /// Deliberately **not abstract**: the platform interface is implemented by
+  /// `maplibre_gl_web` too, and an abstract addition breaks it at compile time
+  /// for a feature the web build has no way to provide. Platforms that do not
+  /// implement it simply do nothing, which is the same outcome the caller has
+  /// to handle anyway when a device fails to create the layer.
+  ///
+  /// Why a native layer rather than a Flutter overlay: an overlay that repaints
+  /// every frame above an Android platform view leaks a full-screen graphics
+  /// buffer per frame under HCPP and takes the process down within seconds.
+  /// Drawn here the particles produce no Flutter frame at all.
+  Future<void> addWindParticleLayer() async {}
+
+  /// Sets the zoom-dependent curves as their endpoints.
+  ///
+  /// The whole table, not a per-zoom evaluation: the numbers keep one home on
+  /// the Dart side, and nothing crosses the channel while a finger is moving.
+  Future<void> setWindParticleTuning(Map<String, double> tuning) async {}
+
+  /// Uploads a wind field as its raw WND1 body plus the header already parsed
+  /// from it, once per forecast frame. Sending the untouched bytes keeps the
+  /// format's only parser on the Dart side, where it is tested.
+  Future<void> setWindParticleField(Map<String, Object> field) async {}
+
+  /// Starts or stops the animation. Stopping also returns the map to
+  /// on-demand rendering, so an idle wind layer costs nothing.
+  Future<void> setWindParticlePlaying(bool playing) async {}
+
+  /// Removes the layer and releases its GPU resources.
+  Future<void> removeWindParticleLayer() async {}
+
   /// Forces the map to use online mode (disables offline mode).
   Future<void> forceOnlineMode();
 
