@@ -1163,13 +1163,12 @@ final class MapLibreMapController
           // WindParticleLayer's class comment).
           if (windParticleLayer == null && mapView != null) {
             WindParticleLayer layer = new WindParticleLayer(mapView);
-            if (layer.attach()) {
+            if (layer.attach(style)) {
               windParticleLayer = layer;
             } else {
               result.error(
                   "WIND_LAYER_UNAVAILABLE",
-                  "the map is not on the SurfaceView renderer; wind particles need "
-                      + "textureMode off",
+                  "the wind custom layer could not be added to the style",
                   null);
               break;
             }
@@ -1186,8 +1185,12 @@ final class MapLibreMapController
             t.zoomHi = call.argument("zoomHi");
             t.particlesLo = call.argument("particlesLo");
             t.particlesHi = call.argument("particlesHi");
-            t.pointSizeLo = call.argument("pointSizeLo");
-            t.pointSizeHi = call.argument("pointSizeHi");
+            t.lineWidthZ3 = call.argument("lineWidthZ3");
+            t.lineWidthZ4 = call.argument("lineWidthZ4");
+            t.lineWidthZ5 = call.argument("lineWidthZ5");
+            t.lineWidthZ6 = call.argument("lineWidthZ6");
+            t.lineWidthZ7 = call.argument("lineWidthZ7");
+            t.particleWidth = call.argument("particleWidth");
             t.speedFactorLo = call.argument("speedFactorLo");
             t.speedFactorHi = call.argument("speedFactorHi");
             t.fadeOpacityLo = call.argument("fadeOpacityLo");
