@@ -39,6 +39,15 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         multiDexEnabled true
     }
+    // The wind layer's MapLibre CustomLayerHost. C++ only because MapLibre
+    // Android exposes no Java entry point into the map's render pass; see the
+    // comment at the top of wind_particle_host.cpp.
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
     lintOptions {
         disable 'InvalidPackage'
     }
