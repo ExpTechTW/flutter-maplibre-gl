@@ -13,6 +13,7 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     private var dragEnabled = true
     private var featureTapsTriggersMapClick = false
     private var isFirstStyleLoad = true
+    private var windParticleLayer: WindParticleLayer?
     private var onStyleLoadedCalled = false
     private var mapReadyResult: FlutterResult?
     private var previousDragCoordinate: CLLocationCoordinate2D?
@@ -1490,6 +1491,108 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
             var reply = [String: NSObject]()
             reply["filter"] = currentLayerFilter as NSObject
             result(reply)
+
+        // The particles are map content, not an overlay: drawn in the map's own
+        // Metal pass they cost Flutter no frame at all — which on Android is
+        // the difference between working and being killed by lmkd, and here is
+        // simply where map content belongs. One wire feeds both platforms.
+        case "windLayer#add":
+            // Not in the Simulator.
+            //
+            // Its Metal is a translation layer hosted in a separate process,
+            // and an invalid command does not surface as an error — it takes
+            // `SimMetalHost` down, the XPC connection dies, and the *app*
+            // aborts inside whatever was drawing next. The report blames
+            // Flutter's own Impeller pass because that is who asked for a
+            // render encoder first:
+            //
+            //     Namespace METAL, Code 102, Connection to SimMetalHost
+            //     XPC service was lost: XPC_ERROR_CONNECTION_INTERRUPTED
+            //
+            // Declining here is the same contract Android already uses when the
+            // map is not on the SurfaceView renderer: Dart marks the layer
+            // unavailable and falls back to the Flutter overlay, which is
+            // ordinary Skia and works fine. Anything the field is meant to show
+            // still gets shown; only the leak-free path is unavailable, and the
+            // leak it avoids is an Android one.
+            #if targetEnvironment(simulator)
+              result(
+                  FlutterError(
+                      code: "WIND_LAYER_UNAVAILABLE",
+                      message: "wind particles need a real GPU; the Simulator's "
+                          + "Metal host cannot host this layer",
+                      details: nil))
+              return
+            #endif
+            if windParticleLayer == nil, let style = mapView.style {
+              let layer = WindParticleLayer(identifier: "dpip-wind-particles")
+              style.addLayer(layer)
+              windParticleLayer = layer
+            }
+            result(nil)
+
+        case "windLayer#setTuning":
+            if let a = methodCall.arguments as? [String: Any], let layer = windParticleLayer {
+              var t = WindTuning()
+              t.zoomLo = a["zoomLo"] as? Double ?? t.zoomLo
+              t.zoomHi = a["zoomHi"] as? Double ?? t.zoomHi
+              t.particlesLo = a["particlesLo"] as? Double ?? t.particlesLo
+              t.particlesHi = a["particlesHi"] as? Double ?? t.particlesHi
+              t.lineWidthZ3 = a["lineWidthZ3"] as? Double ?? t.lineWidthZ3
+              t.lineWidthZ4 = a["lineWidthZ4"] as? Double ?? t.lineWidthZ4
+              t.lineWidthZ5 = a["lineWidthZ5"] as? Double ?? t.lineWidthZ5
+              t.lineWidthZ6 = a["lineWidthZ6"] as? Double ?? t.lineWidthZ6
+              t.lineWidthZ7 = a["lineWidthZ7"] as? Double ?? t.lineWidthZ7
+              t.particleWidth = a["particleWidth"] as? Double ?? t.particleWidth
+              t.speedFactorLo = a["speedFactorLo"] as? Double ?? t.speedFactorLo
+              t.speedFactorHi = a["speedFactorHi"] as? Double ?? t.speedFactorHi
+              t.fadeOpacityLo = a["fadeOpacityLo"] as? Double ?? t.fadeOpacityLo
+              t.fadeOpacityHi = a["fadeOpacityHi"] as? Double ?? t.fadeOpacityHi
+              t.densityCalm = a["densityCalm"] as? Double ?? t.densityCalm
+              t.densityStrong = a["densityStrong"] as? Double ?? t.densityStrong
+              t.speedScale = a["speedScale"] as? Double ?? t.speedScale
+              t.pixelRatio = a["pixelRatio"] as? Double ?? t.pixelRatio
+              layer.setTuning(t)
+            }
+            result(nil)
+
+        case "windLayer#setField":
+            // The raw WND1 body, exactly as Dart received it. Dart already has a
+            // tested parser and hands over the header it read; parsing again
+            // here would be a second copy of the format to keep in step.
+            if let a = methodCall.arguments as? [String: Any],
+               let layer = windParticleLayer,
+               let data = a["bytes"] as? FlutterStandardTypedData {
+              layer.setField(
+                WindFieldUpload(
+                  bytes: data.data,
+                  planeOffset: a["planeOffset"] as? Int ?? 0,
+                  width: a["width"] as? Int ?? 0,
+                  height: a["height"] as? Int ?? 0,
+                  lat0: Float(a["lat0"] as? Double ?? 0),
+                  lon0: Float(a["lon0"] as? Double ?? 0),
+                  dLat: Float(a["dLat"] as? Double ?? 0),
+                  dLon: Float(a["dLon"] as? Double ?? 0),
+                  uMin: Float(a["uMin"] as? Double ?? 0),
+                  uMax: Float(a["uMax"] as? Double ?? 0),
+                  vMin: Float(a["vMin"] as? Double ?? 0),
+                  vMax: Float(a["vMax"] as? Double ?? 0)))
+            }
+            result(nil)
+
+        case "windLayer#setPlaying":
+            if let a = methodCall.arguments as? [String: Any] {
+              windParticleLayer?.setPlaying(a["playing"] as? Bool ?? false)
+            }
+            result(nil)
+
+        case "windLayer#remove":
+            if let layer = windParticleLayer {
+              layer.setPlaying(false)
+              mapView.style?.removeLayer(layer)
+              windParticleLayer = nil
+            }
+            result(nil)
 
         case "style#setStyle":
             if let arguments = methodCall.arguments as? [String: Any] {
