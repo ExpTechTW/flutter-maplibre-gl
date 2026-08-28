@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import MetalKit
 import QuartzCore
 import MapLibre
 import simd
@@ -139,16 +140,40 @@ struct WindTuning {
 /// offscreen work into its own command buffer, and draws only the final quad
 /// into the map's encoder.
 ///
-/// That leaves an ordering question the API gives no way to answer directly:
-/// two queues have no guaranteed order, so compositing a trail texture the
+/// ### Borrowing someone else's encoder
+///
+/// Two things follow from that quad being drawn into a pass this class did not
+/// configure, and both were got wrong before:
+///
+/// * **The pipeline must describe the map's attachments, not ours.** Colour
+///   format comes from `MLNMapView.backendResource()`'s MTKView; the pass also
+///   carries a `.depth32Float_stencil8` attachment, and a pipeline that omits
+///   it can never be valid there. An invalid pipeline is not a slow path — the
+///   draw is dropped, and nothing on screen says why.
+/// * **The depth/stencil *state* is inherited.** The map stencils its own
+///   geometry; whatever mask the previous layer left is still bound. Depth
+///   always, depth write off, stencil unconfigured.
+///
+/// Both are what MapLibre's own
+/// `platform/darwin/app/PluginLayerExampleMetalRendering.mm` does, and it is
+/// the only worked example of drawing into this encoder that exists.
+///
+/// ### Ordering across two queues
+///
+/// Two queues have no guaranteed order, so compositing a trail texture the
 /// other queue wrote *this frame* is a read of memory that may not be written
-/// yet. The fix is the ping-pong that was already there for other reasons —
-/// the composite samples the buffer written on the **previous** frame, so a
-/// whole vsync separates the write from the read. It costs one frame of
-/// latency on a trail effect, which is invisible, and it avoids a
-/// `waitUntilCompleted` that would stall the pipeline every frame. If this ever
-/// does tear, the rigorous fix is an `MTLSharedEvent` signalled by the
-/// offscreen buffer, not a smaller ping-pong.
+/// yet. The ping-pong is what separates them: the composite samples the buffer
+/// written on the **previous** frame, so a whole vsync sits between the write
+/// and the read. That costs one frame of latency on a trail effect, which is
+/// invisible, and avoids a `waitUntilCompleted` that would stall every frame.
+///
+/// It only works if the swap happens **after** the composite has read. It used
+/// to happen at the end of the offscreen encode, one line before the composite
+/// — so the composite sampled the texture the command buffer had only just
+/// been handed, and the separation the design relies on never existed.
+///
+/// If this ever does tear even so, the rigorous fix is an `MTLSharedEvent`
+/// signalled by the offscreen buffer, not a smaller ping-pong.
 class WindParticleLayer: MLNCustomStyleLayer {
   private static let stateEdge = 256
   private static let blocks = 16
@@ -230,6 +255,9 @@ class WindParticleLayer: MLNCustomStyleLayer {
   private var segmentPipeline: MTLRenderPipelineState?
   private var compositePipeline: MTLRenderPipelineState?
   private var projectPipeline: MTLRenderPipelineState?
+  /// Depth always, no write, no stencil test — the state the map's own
+  /// encoder is *not* guaranteed to be in. See `composite`.
+  private var passThroughDepth: MTLDepthStencilState?
   private var stateSampler: MTLSamplerState?
   private var windSampler: MTLSamplerState?
   private var projSampler: MTLSamplerState?
@@ -345,7 +373,7 @@ class WindParticleLayer: MLNCustomStyleLayer {
     guard let encoder = renderEncoder else { return }
     guard context.size.width > 0, context.size.height > 0 else { return }
 
-    if device == nil, !makeDevice(encoder: encoder) { return }
+    if device == nil, !makeDevice(mapView: mapView, encoder: encoder) { return }
     if let upload = pendingField {
       pendingField = nil
       uploadField(upload)
@@ -379,10 +407,14 @@ class WindParticleLayer: MLNCustomStyleLayer {
 
     // Offscreen work uses our own queue. A skipped simulation callback still
     // composites below because MapLibre supplied a fresh map framebuffer.
-    encodeOffscreen(uniforms: &u, context: context, dt: dt)
+    let advanced = encodeOffscreen(uniforms: &u, context: context, dt: dt)
     frame &+= 1
 
+    // Reads the buffer the pass above did *not* write, which is the completed
+    // one from the previous frame — the whole reason there are two. The flip
+    // follows, so the next frame reads what was just encoded.
     composite(encoder: encoder, uniforms: &u)
+    if advanced { trailFront = 1 - trailFront }
 
     // One line, on the first frame that reaches the screen, and then rarely.
     //
@@ -434,15 +466,18 @@ class WindParticleLayer: MLNCustomStyleLayer {
 
   // ------------------------------------------------------------------- passes
 
+  /// Returns whether a simulation frame was actually encoded, so the caller
+  /// only advances the ping-pong when there is something new to advance to.
+  @discardableResult
   private func encodeOffscreen(uniforms u: inout WindUniforms,
                                context: MLNStyleLayerDrawingContext,
-                               dt: Double) {
+                               dt: Double) -> Bool {
     guard let queue, let buffer = queue.makeCommandBuffer(),
           let updatePipeline, let fadePipeline, let segmentPipeline,
           let projectPipeline, let stateSampler, let windSampler,
           let projSampler, let windTex, let projTex,
           let vertexBuffer, let indexBuffer
-    else { return }
+    else { return false }
 
     let t = tuning
     let zoom = context.zoomLevel
@@ -564,7 +599,7 @@ class WindParticleLayer: MLNCustomStyleLayer {
 
     guard let enc = buffer.makeRenderCommandEncoder(descriptor: trailPass) else {
       buffer.commit()
-      return
+      return false
     }
     if !wasDirty {
       // Keyed to real time, not to the callback count: a 120 Hz panel delivers
@@ -620,7 +655,11 @@ class WindParticleLayer: MLNCustomStyleLayer {
     }
     enc.endEncoding()
     buffer.commit()
-    trailFront = 1 - trailFront
+    // The flip is the caller's, once the composite has read the buffer this
+    // pass did *not* write. Doing it here read back the texture the command
+    // buffer above had only just been handed — the ping-pong the class comment
+    // describes never actually happened.
+    return true
   }
 
   private func clearTrail(other index: Int, in buffer: MTLCommandBuffer) {
@@ -639,6 +678,7 @@ class WindParticleLayer: MLNCustomStyleLayer {
     u.fld.w = Self.compositeGain
     u.misc = SIMD4(0, 0, Self.compositeLift, 0)
     encoder.setRenderPipelineState(compositePipeline)
+    if let passThroughDepth { encoder.setDepthStencilState(passThroughDepth) }
     encoder.setFragmentBytes(&u, length: MemoryLayout<WindUniforms>.stride, index: 0)
     // The buffer written on the previous frame — see the class comment.
     encoder.setFragmentTexture(trailTex[trailFront], index: 0)
@@ -726,7 +766,8 @@ class WindParticleLayer: MLNCustomStyleLayer {
 
   // ------------------------------------------------------------------ resources
 
-  private func makeDevice(encoder: MTLRenderCommandEncoder) -> Bool {
+  private func makeDevice(mapView: MLNMapView,
+                         encoder: MTLRenderCommandEncoder) -> Bool {
     let dev = encoder.device
     guard let q = dev.makeCommandQueue() else { return false }
     let library: MTLLibrary
@@ -749,12 +790,21 @@ class WindParticleLayer: MLNCustomStyleLayer {
       return false
     }
 
+    // `depthStencil` is set only for the composite: the offscreen passes render
+    // into this class's own colour-only textures, and declaring an attachment
+    // they do not have would invalidate them the same way omitting it
+    // invalidates the composite.
     func pipeline(_ v: MTLFunction, _ f: MTLFunction, _ format: MTLPixelFormat,
-                  premultipliedBlend: Bool) -> MTLRenderPipelineState? {
+                  premultipliedBlend: Bool,
+                  depthStencil: MTLPixelFormat? = nil) -> MTLRenderPipelineState? {
       let d = MTLRenderPipelineDescriptor()
       d.vertexFunction = v
       d.fragmentFunction = f
       d.colorAttachments[0].pixelFormat = format
+      if let depthStencil {
+        d.depthAttachmentPixelFormat = depthStencil
+        d.stencilAttachmentPixelFormat = depthStencil
+      }
       if premultipliedBlend {
         // The generations overlap constantly, and straight alpha would let the
         // newest erase the older ones instead of adding to them.
@@ -771,18 +821,42 @@ class WindParticleLayer: MLNCustomStyleLayer {
     projectPipeline = pipeline(updateV, projectF, .rgba8Unorm, premultipliedBlend: false)
     fadePipeline = pipeline(quadV, screenF, .rgba8Unorm, premultipliedBlend: false)
     segmentPipeline = pipeline(segV, segF, .rgba8Unorm, premultipliedBlend: true)
-    // The map's drawable format is not exposed anywhere on this API, so both
-    // plausible orders are tried. Guessing one and shipping it would fail as a
-    // pipeline that silently never builds — which looks exactly like a layer
-    // that was never added.
-    compositePipeline =
-      pipeline(quadV, screenF, .bgra8Unorm, premultipliedBlend: true)
-      ?? pipeline(quadV, screenF, .rgba8Unorm, premultipliedBlend: true)
+    // The composite is the one pass that lands in the map's own render pass,
+    // so its pipeline has to describe that pass exactly — a pipeline that does
+    // not match the attachments it is set on is not a slow path, it is an
+    // invalid one, and the draw is dropped with nothing on screen to say so.
+    //
+    // The formats are readable, not guessable: `backendResource` carries the
+    // MTKView the map draws into, and MapLibre's own plugin-layer example
+    // (`platform/darwin/app/PluginLayerExampleMetalRendering.mm`) pins the
+    // depth/stencil pair it attaches. An earlier version here declared neither
+    // and tried `.bgra8Unorm ?? .rgba8Unorm` for the colour — which builds a
+    // pipeline that can never be valid against a pass that has a
+    // depth-stencil attachment.
+    let resource = mapView.backendResource()
+    let drawableFormat = resource.mtkView?.colorPixelFormat ?? .bgra8Unorm
+    compositePipeline = pipeline(
+      quadV, screenF, drawableFormat, premultipliedBlend: true,
+      depthStencil: .depth32Float_stencil8)
+
+    // And the encoder's depth/stencil *state* is whatever the layer drawn
+    // before this one left behind. The map stencils its own geometry, so
+    // inheriting that mask is how a correct quad ends up invisible. Depth
+    // always, depth write off, stencil test unconfigured (= disabled) — the
+    // same three the example sets for the same reason.
+    let ds = MTLDepthStencilDescriptor()
+    ds.depthCompareFunction = .always
+    ds.isDepthWriteEnabled = false
+    passThroughDepth = dev.makeDepthStencilState(descriptor: ds)
 
     guard updatePipeline != nil, fadePipeline != nil, segmentPipeline != nil,
           compositePipeline != nil, projectPipeline != nil
     else {
-      NSLog("WindParticleLayer: pipeline creation failed")
+      NSLog(
+        "WindParticleLayer: pipeline creation failed "
+          + "(drawable=%ld update=%d project=%d fade=%d segment=%d composite=%d)",
+        drawableFormat.rawValue, updatePipeline != nil, projectPipeline != nil,
+        fadePipeline != nil, segmentPipeline != nil, compositePipeline != nil)
       return false
     }
 
