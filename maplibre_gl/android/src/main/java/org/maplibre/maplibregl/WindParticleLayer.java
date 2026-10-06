@@ -183,6 +183,15 @@ final class WindParticleLayer {
   /** {@code glSpeedPx}: the reference's speed unit, screen pixels per second. */
   private static final double SPEED_PX = 100.0;
 
+  /** {@code 1/glMaxSpeedParam}, {@code glMinSpeedParam/glMaxSpeedParam}, {@code cPow}. */
+  private static final float CURVE_MUL = 1f / 30f;
+  private static final float CURVE_MIN = 1.5f / 30f;
+  private static final float CURVE_POW = 0.35f;
+
+  /** Exact in float32: both divisors are powers of two. */
+  private static final float INV_STATE_EDGE = 1f / STATE_EDGE;
+  private static final float INV_BLOCK = 1f / BLOCKS;
+
   /**
    * {@code zoom2speed}, transcribed. Wind is slowed at the widest zooms, where
    * a degree is a handful of pixels and true speed reads as a flicker.
@@ -453,8 +462,11 @@ final class WindParticleLayer {
           + "  vec2 posA = fract(tex0.ba + tex0.rg / 255.5) * 2.0 - 1.0;\n"
           + "  vec2 posB = fract(tex1.ba + tex1.rg / 255.5) * 2.0 - 1.0;\n"
           + "  vec2 dirF = posA - posB;\n"
-          + "  vec2 dirFN = normalize(dirF);\n"
+          // One length for both the unit vector and the wrap test. normalize()
+          // is dir/length, so a second length() repeated the same square root
+          // on every corner of every particle.
           + "  float d = length(dirF);\n"
+          + "  vec2 dirFN = dirF / max(d, 1e-20);\n"
           + "  vec2 dirRN = vec2(dirFN.y, -dirFN.x);\n"
           + "  vec2 pos = mix(posB, posA, a_vert.w * 0.003921569);\n"
           + "  pos += dirRN * (a_vert.zz * u_line.xy + u_line.zw);\n"
@@ -535,8 +547,13 @@ final class WindParticleLayer {
 
   private final MapView mapView;
 
-  /** Set from the platform thread, read on the GL thread. */
-  private volatile CameraSnapshot camera;
+  /** Filled and read on the render thread. One instance, overwritten each frame. */
+  private final CameraSnapshot renderCamera = new CameraSnapshot();
+
+  private CameraSnapshot camera;
+
+  /** Reused across frames. {@link GlState#capture()} used to allocate this every frame. */
+  private final GlState savedGl = new GlState();
 
   private volatile FieldUpload pendingField;
   private volatile Tuning tuning = Tuning.defaults();
@@ -586,15 +603,15 @@ final class WindParticleLayer {
     if (released || !playing) {
       return;
     }
-    camera =
-        new CameraSnapshot(
-            lat,
-            lng,
-            zoom,
-            bearing,
-            (int) Math.round(width),
-            (int) Math.round(height),
-            displayDensity);
+    renderCamera.set(
+        lat,
+        lng,
+        zoom,
+        bearing,
+        (double) (int) Math.round(width),
+        (double) (int) Math.round(height),
+        displayDensity);
+    camera = renderCamera;
     try {
       drawFrame();
     } catch (RuntimeException e) {
@@ -607,6 +624,7 @@ final class WindParticleLayer {
   @SuppressWarnings("unused") // called from wind_particle_host.cpp
   void onNativeContextLost() {
     quadProgram = 0;
+    uniformLocationsReady = false;
     glContext = null;
     trailsDirty = true;
   }
@@ -666,6 +684,35 @@ final class WindParticleLayer {
   private int drawProgram;
   private int updateProgram;
   private int projectProgram;
+  private boolean uniformLocationsReady;
+  private int aPosQuad;
+  private int aPosUpdate;
+  private int aPosProject;
+  private int aVertDraw;
+  private int uField;
+  private int uWindMin;
+  private int uWindMax;
+  private int uCurve;
+  private int uWorld;
+  private int uCenter;
+  private int uHalf;
+  private int uRot;
+  private int uLon0;
+  private int uLat;
+  private int uWind;
+  private int uParticles;
+  private int uDisp;
+  private int uScreen;
+  private int uOpacity;
+  private int uLift;
+  private int uShift;
+  private int uState0;
+  private int uState1;
+  private int uLen;
+  private int uLine;
+  private int uEdge;
+  private int uBlock;
+  private int uColour;
   private int quadBuffer;
   private int vertexBuffer;
   private int indexBuffer;
@@ -743,16 +790,39 @@ final class WindParticleLayer {
   private double trailLat;
   private double trailLng;
   private double trailBearing;
+  /** Mercator Y of {@link #trailLat}, saved with it so a pan does not recompute it. */
+  private double trailMerc;
+
+  /**
+   * Projection inputs that stay bit-identical while that component of the
+   * camera is unchanged. A one-finger pan keeps zoom and bearing fixed, which
+   * is the case that used to redo {@code pow(2, zoom)}, {@code sin} and
+   * {@code cos} on every frame.
+   */
+  private double frameZoom = Double.NaN;
+  private double frameBearing = Double.NaN;
+  private double frameLat = Double.NaN;
+  private double frameWorld;
+  private double frameCx;
+  private double frameCy;
+  private double frameCos = 1;
+  private double frameSin;
+  private double frameMerc;
+
+  /** Denominator of the particle-count curve, cached while zoom is unchanged. */
+  private double amountZoom = Double.NaN;
+  private double amountDenom;
 
   /** Set when the trails must be discarded: camera moved, or a new field landed. */
   private boolean trailsDirty = true;
+  private long lastTrailClearLogNanos;
 
-  /** Camera + viewport for one frame, snapshotted so the GL thread never blocks. */
+  /** Camera + viewport for one frame, filled on the render thread. */
   static final class CameraSnapshot {
-    final double centerLat;
-    final double centerLng;
-    final double zoom;
-    final double bearing;
+    double centerLat;
+    double centerLng;
+    double zoom;
+    double bearing;
 
     /**
      * Viewport in **logical** points, as the renderer reports it.
@@ -761,9 +831,9 @@ final class WindParticleLayer {
      * the same three uses: halved for the projection, multiplied by the density
      * for the framebuffer, and multiplied out for the particle count.
      */
-    final double width;
+    double width;
 
-    final double height;
+    double height;
 
     /**
      * Display density, the bridge between the two pixel spaces in play.
@@ -774,7 +844,7 @@ final class WindParticleLayer {
      * 2.625 on a Pixel 9 — which looks like the wind blowing over the wrong
      * part of the map rather than like a unit bug.
      */
-    final double density;
+    double density = 1;
 
     /** Framebuffer size in physical pixels — what the offscreen textures are. */
     int physicalWidth() {
@@ -785,7 +855,7 @@ final class WindParticleLayer {
       return (int) Math.round(height * density);
     }
 
-    CameraSnapshot(
+    void set(
         double centerLat,
         double centerLng,
         double zoom,
@@ -1057,10 +1127,6 @@ final class WindParticleLayer {
     }
   }
 
-  void setCamera(CameraSnapshot snapshot) {
-    camera = snapshot;
-  }
-
   void setTuning(Tuning value) {
     tuning = value;
   }
@@ -1216,28 +1282,29 @@ final class WindParticleLayer {
     // is both the common case and the one that looks worst when discarded.
     trailShiftX = 0;
     trailShiftY = 0;
+    updateFrameGeometry(cam);
     if (haveTrailCam) {
       boolean reprojected =
           Math.abs(cam.zoom - trailZoom) > 1e-4 || Math.abs(cam.bearing - trailBearing) > 0.05;
       if (reprojected) {
-        markTrailsDirty(
-            String.format(
-                "reprojected dZoom=%.6f dBearing=%.4f",
-                cam.zoom - trailZoom, cam.bearing - trailBearing));
+        if (noteTrailsDirty()) {
+          Log.i(
+              TAG,
+              String.format(
+                  "trails cleared: reprojected dZoom=%.6f dBearing=%.4f",
+                  cam.zoom - trailZoom, cam.bearing - trailBearing));
+        }
       } else if (Math.abs(cam.centerLat - trailLat) > 1e-9
           || Math.abs(cam.centerLng - trailLng) > 1e-9) {
         // `projectField` puts a world point at
         //     half + (w - centre) rotated by u_rot,
         // so moving the centre by d moves every fixed point on screen by -d,
-        // rotated the same way.
-        double world = 512 * Math.pow(2.0, cam.zoom);
-        double dcx = ((cam.centerLng - trailLng) / 360) * world;
-        double dcy = (mercatorY(cam.centerLat) - mercatorY(trailLat)) * world;
-        double r = -cam.bearing * Math.PI / 180;
-        double cosR = Math.cos(r);
-        double sinR = Math.sin(r);
-        double dx = -dcx * cosR + dcy * sinR;
-        double dy = -dcx * sinR - dcy * cosR;
+        // rotated the same way. Zoom, bearing and the centre's mercator Y are
+        // the values updateFrameGeometry just stored.
+        double dcx = ((cam.centerLng - trailLng) / 360) * frameWorld;
+        double dcy = (frameMerc - trailMerc) * frameWorld;
+        double dx = -dcx * frameCos + dcy * frameSin;
+        double dy = -dcx * frameSin - dcy * frameCos;
         // The fade pass samples at `1 - v_tex`, where u maps to screen x and v
         // to screen y with y pointing *up*. Content that moved by (dx, dy) is
         // read back from (-dx, +dy).
@@ -1246,8 +1313,9 @@ final class WindParticleLayer {
         if (Math.abs(shiftX) > 0.5 || Math.abs(shiftY) > 0.5) {
           // More than half the viewport: almost nothing survives the move, and
           // what does is a thin band of stale streaks along one edge.
-          markTrailsDirty(
-              String.format("panned shift=%.3f,%.3f", shiftX, shiftY));
+          if (noteTrailsDirty()) {
+            Log.i(TAG, String.format("trails cleared: panned shift=%.3f,%.3f", shiftX, shiftY));
+          }
         } else {
           trailShiftX = (float) shiftX;
           trailShiftY = (float) shiftY;
@@ -1268,13 +1336,40 @@ final class WindParticleLayer {
     trailLat = cam.centerLat;
     trailLng = cam.centerLng;
     trailBearing = cam.bearing;
+    trailMerc = frameMerc;
 
-    GlState saved = GlState.capture();
+    savedGl.capture();
     try {
-      renderPasses(cam, saved);
+      renderPasses(cam, savedGl);
     } finally {
-      saved.restore();
+      savedGl.restore();
     }
+  }
+
+  /**
+   * World size, bearing rotation and the centre's mercator Y for this frame.
+   *
+   * <p>Each piece is skipped when its input is the same bits as last frame, so
+   * a pan does not repeat {@code 2^zoom} or the bearing trig, and a zoom does
+   * not repeat the mercator of an unchanged latitude.
+   */
+  private void updateFrameGeometry(CameraSnapshot cam) {
+    if (cam.zoom != frameZoom) {
+      frameZoom = cam.zoom;
+      frameWorld = 512.0 * Math.pow(2.0, cam.zoom);
+    }
+    if (cam.bearing != frameBearing) {
+      frameBearing = cam.bearing;
+      double r = -cam.bearing * Math.PI / 180.0;
+      frameCos = Math.cos(r);
+      frameSin = Math.sin(r);
+    }
+    if (cam.centerLat != frameLat) {
+      frameLat = cam.centerLat;
+      frameMerc = mercatorY(cam.centerLat);
+    }
+    frameCx = (cam.centerLng + 180.0) / 360.0 * frameWorld;
+    frameCy = frameMerc * frameWorld;
   }
 
   /**
@@ -1302,6 +1397,26 @@ final class WindParticleLayer {
     trailsDirty = true;
   }
 
+  /**
+   * Marks the trails dirty. Logs at most twice a second: a pinch clears them
+   * on every frame, and formatting plus {@code Log.i} on the GL thread is
+   * enough to hitch the gesture.
+   *
+   * @return true when the caller should emit the detailed line
+   */
+  private boolean noteTrailsDirty() {
+    if (trailsDirty) {
+      return false;
+    }
+    trailsDirty = true;
+    long now = System.nanoTime();
+    if (now - lastTrailClearLogNanos < 500_000_000L) {
+      return false;
+    }
+    lastTrailClearLogNanos = now;
+    return true;
+  }
+
   private static String encodingName(int value) {
     if (value == GLES30.GL_SRGB) return "SRGB";
     if (value == GLES20.GL_LINEAR) return "LINEAR";
@@ -1318,6 +1433,7 @@ final class WindParticleLayer {
   }
 
   private void renderPasses(CameraSnapshot cam, GlState target) {
+    ensureUniformLocations();
     Tuning t = tuning;
 
     // The offscreen state and trail passes own RGBA textures and need every
@@ -1407,8 +1523,11 @@ final class WindParticleLayer {
     // then halved off desktop, and divided by the 65,536-particle pool.
     double logicalW = cam.width;
     double logicalH = cam.height;
-    double amount =
-        Math.min(15000, Math.round(logicalW * logicalH / (50.0 * Math.pow(1.6, cam.zoom - 2))));
+    if (cam.zoom != amountZoom) {
+      amountZoom = cam.zoom;
+      amountDenom = 50.0 * Math.pow(1.6, cam.zoom - 2);
+    }
+    double amount = Math.min(15000, Math.round(logicalW * logicalH / amountDenom));
     double relativeAmount = amount * 0.5 / (STATE_EDGE * (double) STATE_EDGE) * GL_COUNT_MUL;
     int perBlock = Math.max(
         1, Math.min(indexCount, (int) Math.round(relativeAmount * PARTICLES_PER_BLOCK)));
@@ -1452,15 +1571,14 @@ final class WindParticleLayer {
     GLES20.glDisable(GLES20.GL_DEPTH_TEST);
     GLES20.glDisable(GLES20.GL_STENCIL_TEST);
     GLES20.glUseProgram(projectProgram);
-    bindQuad(projectProgram);
-    bindTexture(GLES20.GL_TEXTURE0, windTex, projectProgram, "u_field", 0);
-    uniform2f(projectProgram, "u_wind_min", windRange[0], windRange[2]);
-    uniform2f(projectProgram, "u_wind_max", windRange[1], windRange[3]);
+    bindQuad(aPosProject);
+    bindTexture(GLES20.GL_TEXTURE0, windTex, uField, 0);
+    GLES20.glUniform2f(uWindMin, windRange[0], windRange[2]);
+    GLES20.glUniform2f(uWindMax, windRange[1], windRange[3]);
     // (speedMul, speedMin, cPow) = (1/glMaxSpeedParam,
     //  glMinSpeedParam/glMaxSpeedParam, glSpeedCurvePowParam/2).
-    GLES20.glUniform3f(
-        GLES20.glGetUniformLocation(projectProgram, "u_curve"), 1f / 30f, 1.5f / 30f, 0.35f);
-    setProjection(projectProgram, cam);
+    GLES20.glUniform3f(uCurve, CURVE_MUL, CURVE_MIN, CURVE_POW);
+    setProjection(cam);
     GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
 
     // --- update pass: advect every particle into the back state texture
@@ -1472,9 +1590,9 @@ final class WindParticleLayer {
         0);
     GLES20.glViewport(0, 0, STATE_EDGE, STATE_EDGE);
     GLES20.glUseProgram(updateProgram);
-    bindQuad(updateProgram);
-    bindTexture(GLES20.GL_TEXTURE0, projTex, updateProgram, "u_wind", 0);
-    bindTexture(GLES20.GL_TEXTURE1, stateTex[stateFront], updateProgram, "u_particles", 1);
+    bindQuad(aPosUpdate);
+    bindTexture(GLES20.GL_TEXTURE0, projTex, uWind, 0);
+    bindTexture(GLES20.GL_TEXTURE1, stateTex[stateFront], uParticles, 1);
 
     // uPars1, transcribed: the stored 0..1 direction becomes a displacement of
     // at most `o` normalised units, where `o` is how far the reference's speed
@@ -1485,8 +1603,7 @@ final class WindParticleLayer {
     double timeScale = SPEED_PX * zoomSpeed(cam.zoom) * t.pixelRatio;
     float ox = (float) (seconds * timeScale / screenWidth);
     float oy = (float) (seconds * timeScale / screenHeight);
-    GLES20.glUniform4f(
-        GLES20.glGetUniformLocation(updateProgram, "u_disp"), 2 * ox, 2 * oy, -ox, -oy);
+    GLES20.glUniform4f(uDisp, 2 * ox, 2 * oy, -ox, -oy);
     GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
 
     stateFront = 1 - stateFront;
@@ -1525,20 +1642,18 @@ final class WindParticleLayer {
       trailsDirty = false;
     } else {
       GLES20.glUseProgram(quadProgram);
-      bindQuad(quadProgram);
-      bindTexture(GLES20.GL_TEXTURE2, screenTex[screenFront], quadProgram, "u_screen", 2);
+      bindQuad(aPosQuad);
+      bindTexture(GLES20.GL_TEXTURE2, screenTex[screenFront], uScreen, 2);
       // Keyed to real time, not to the callback count. The reference applies
       // its fade once per frame and gets away with it because a browser's rAF
       // is the display refresh; MapLibre hands this layer ~106 callbacks a
       // second on a 120 Hz panel regardless of `setMaximumFps(60)`, and a
       // per-callback 0.97 then halves the trail length against a 60 Hz device.
       // `dt * 60` restores the intended per-second decay on any refresh rate.
-      uniform1f(
-          quadProgram,
-          "u_opacity",
-          (float) Math.pow(t.fadeOpacity(cam.zoom), dt * TARGET_FPS));
-      uniform1f(quadProgram, "u_lift", 0f);
-      uniform2f(quadProgram, "u_shift", trailShiftX, trailShiftY);
+      GLES20.glUniform1f(
+          uOpacity, (float) Math.pow(t.fadeOpacity(cam.zoom), dt * TARGET_FPS));
+      GLES20.glUniform1f(uLift, 0f);
+      GLES20.glUniform2f(uShift, trailShiftX, trailShiftY);
       GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
     }
 
@@ -1551,13 +1666,12 @@ final class WindParticleLayer {
     GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA);
     GLES20.glUseProgram(drawProgram);
     GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vertexBuffer);
-    int vertLoc = GLES20.glGetAttribLocation(drawProgram, "a_vert");
-    GLES20.glEnableVertexAttribArray(vertLoc);
+    GLES20.glEnableVertexAttribArray(aVertDraw);
     // Unnormalised: the shader wants the raw 0..255 so it can pick corners.
-    GLES20.glVertexAttribPointer(vertLoc, 4, GLES20.GL_UNSIGNED_BYTE, false, 4, 0);
+    GLES20.glVertexAttribPointer(aVertDraw, 4, GLES20.GL_UNSIGNED_BYTE, false, 4, 0);
     GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-    bindTexture(GLES20.GL_TEXTURE1, stateTex[stateFront], drawProgram, "u_state0", 1);
-    bindTexture(GLES20.GL_TEXTURE3, stateTex[1 - stateFront], drawProgram, "u_state1", 3);
+    bindTexture(GLES20.GL_TEXTURE1, stateTex[stateFront], uState0, 1);
+    bindTexture(GLES20.GL_TEXTURE3, stateTex[1 - stateFront], uState1, 3);
 
 
     // Line width in NDC. Wider at high zoom, where there are fewer particles —
@@ -1572,12 +1686,9 @@ final class WindParticleLayer {
     float aw = (widthFactor + 1f) / screenWidth;
     float ah = (widthFactor + 1f) / screenHeight;
     float halfLen = Math.max(1f, widthFactor * 0.8f);
-    uniform1f(drawProgram, "u_len", halfLen);
-    GLES20.glUniform4f(
-        GLES20.glGetUniformLocation(drawProgram, "u_line"),
-        aw * 2f / 255f, ah * 2f / 255f, -aw, -ah);
-    GLES20.glUniform4f(
-        GLES20.glGetUniformLocation(drawProgram, "u_edge"), 0f, 0f, halfLen * 2f / 255f, -halfLen);
+    GLES20.glUniform1f(uLen, halfLen);
+    GLES20.glUniform4f(uLine, aw * 2f / 255f, ah * 2f / 255f, -aw, -ah);
+    GLES20.glUniform4f(uEdge, 0f, 0f, halfLen * 2f / 255f, -halfLen);
 
     // The age of the newest generation, in frames. Every older block is another
     // BLOCK_FRAMES behind it, wrapping through the 128-frame cycle.
@@ -1588,29 +1699,29 @@ final class WindParticleLayer {
     int age = (int) blockFrame;
     for (int b = 0; b < BLOCKS; b++) {
       int block = (stateBlock - 1 - b + 2 * BLOCKS) % BLOCKS;
-      GLES20.glUniform4f(
-          GLES20.glGetUniformLocation(drawProgram, "u_block"),
-          1f / STATE_EDGE, 1f / STATE_EDGE, 0f, block / (float) BLOCKS);
+      GLES20.glUniform4f(uBlock, INV_STATE_EDGE, INV_STATE_EDGE, 0f, block * INV_BLOCK);
       float a = alphaLut[age % LIFETIME];
-      GLES20.glUniform4f(GLES20.glGetUniformLocation(drawProgram, "u_colour"), a, a, a, a);
+      GLES20.glUniform4f(uColour, a, a, a, a);
       GLES20.glDrawElements(
           GLES20.GL_TRIANGLES, perBlock * 6, GLES20.GL_UNSIGNED_SHORT, 0);
       age += BLOCK_FRAMES;
     }
-    GLES20.glDisableVertexAttribArray(vertLoc);
+    GLES20.glDisableVertexAttribArray(aVertDraw);
     GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0);
-    // Did the offscreen work actually land? An FBO that is momentarily
-    // incomplete, or a driver error mid-pass, produces a frame with no strokes
-    // in it — which is indistinguishable from a flicker by eye and obvious in
-    // a counter.
-    if (GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
-        != GLES20.GL_FRAMEBUFFER_COMPLETE) {
-      fboIncomplete++;
-    }
-    int err = GLES20.glGetError();
-    if (err != GLES20.GL_NO_ERROR) {
-      glErrors++;
-      lastGlError = err;
+    // glCheckFramebufferStatus and glGetError flush the command stream. Doing
+    // that on every frame stalled the GPU. The error flag sticks until it is
+    // read, so sampling once a second still counts a persistent failure; the
+    // counters are only printed every 600 frames anyway.
+    if ((frame & 63) == 0) {
+      if (GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+          != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+        fboIncomplete++;
+      }
+      int err = GLES20.glGetError();
+      if (err != GLES20.GL_NO_ERROR) {
+        glErrors++;
+        lastGlError = err;
+      }
     }
     screenFront = 1 - screenFront;
 
@@ -1731,27 +1842,23 @@ final class WindParticleLayer {
     GLES20.glEnable(GLES20.GL_BLEND);
     GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA);
     GLES20.glUseProgram(quadProgram);
-    bindQuad(quadProgram);
-    bindTexture(GLES20.GL_TEXTURE2, screenTex[screenFront], quadProgram, "u_screen", 2);
+    bindQuad(aPosQuad);
+    bindTexture(GLES20.GL_TEXTURE2, screenTex[screenFront], uScreen, 2);
     // The reference deposits dim strokes and composites them below full
     // strength so sixteen generations remain a weave rather than a white fill.
-    uniform1f(quadProgram, "u_opacity", COMPOSITE_GAIN);
-    uniform1f(quadProgram, "u_lift", COMPOSITE_LIFT);
-    uniform2f(quadProgram, "u_shift", 0f, 0f);
+    GLES20.glUniform1f(uOpacity, COMPOSITE_GAIN);
+    GLES20.glUniform1f(uLift, COMPOSITE_LIFT);
+    GLES20.glUniform2f(uShift, 0f, 0f);
     GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
   }
 
-  private void setProjection(int program, CameraSnapshot cam) {
-    double world = 512 * Math.pow(2.0, cam.zoom);
-    double cx = (cam.centerLng + 180) / 360 * world;
-    double cy = mercatorY(cam.centerLat) * world;
-    double r = -cam.bearing * Math.PI / 180;
-    uniform1f(program, "u_world", (float) world);
-    uniform2f(program, "u_center", (float) cx, (float) cy);
-    uniform2f(program, "u_half", (float) cam.halfWidth(), (float) cam.halfHeight());
-    uniform2f(program, "u_rot", (float) Math.cos(r), (float) Math.sin(r));
-    uniform1f(program, "u_lon0", fieldLon0);
-    uniform2f(program, "u_lat", fieldLat0, fieldLatSpan);
+  private void setProjection(CameraSnapshot cam) {
+    GLES20.glUniform1f(uWorld, (float) frameWorld);
+    GLES20.glUniform2f(uCenter, (float) frameCx, (float) frameCy);
+    GLES20.glUniform2f(uHalf, (float) cam.halfWidth(), (float) cam.halfHeight());
+    GLES20.glUniform2f(uRot, (float) frameCos, (float) frameSin);
+    GLES20.glUniform1f(uLon0, fieldLon0);
+    GLES20.glUniform2f(uLat, fieldLat0, fieldLatSpan);
   }
 
   /**
@@ -1962,16 +2069,7 @@ final class WindParticleLayer {
       // Zeroed, not left undefined: the first fade pass samples this texture
       // and composites the result over the map, so uninitialised contents are
       // driver-dependent garbage painted across the whole viewport.
-      GLES20.glTexImage2D(
-          GLES20.GL_TEXTURE_2D,
-          0,
-          GLES20.GL_RGBA,
-          width,
-          height,
-          0,
-          GLES20.GL_RGBA,
-          GLES20.GL_UNSIGNED_BYTE,
-          ByteBuffer.wrap(new byte[width * height * 4]));
+      allocateCleared(screenTex[i], width, height);
     }
     // The reprojected field shares the trails' resolution. It is resampled by
     // the update pass at arbitrary particle positions, so LINEAR — NEAREST here
@@ -1980,6 +2078,23 @@ final class WindParticleLayer {
       GLES20.glDeleteTextures(1, new int[] {projTex}, 0);
     }
     projTex = createTexture(GLES20.GL_LINEAR);
+    allocateCleared(projTex, width, height);
+    screenWidth = width;
+    screenHeight = height;
+    markTrailsDirty("viewport " + width + "x" + height);
+  }
+
+  /**
+   * Allocates {@code texture} and clears it to transparent black.
+   *
+   * <p>Uploading a Java {@code byte[]} of {@code width * height * 4} did the
+   * same clear and, on a resize, allocated three full-screen buffers on the
+   * render thread. {@code glTexImage2D} with a null pointer leaves the texels
+   * undefined; the clear is what makes them zero. GL state touched here is put
+   * back, because this runs before the frame's {@link GlState#capture()}.
+   */
+  private void allocateCleared(int texture, int width, int height) {
+    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture);
     GLES20.glTexImage2D(
         GLES20.GL_TEXTURE_2D,
         0,
@@ -1989,10 +2104,40 @@ final class WindParticleLayer {
         0,
         GLES20.GL_RGBA,
         GLES20.GL_UNSIGNED_BYTE,
-        ByteBuffer.wrap(new byte[width * height * 4]));
-    screenWidth = width;
-    screenHeight = height;
-    markTrailsDirty("viewport " + width + "x" + height);
+        null);
+    if (framebuffer == 0) {
+      return;
+    }
+    int[] prevFbo = new int[1];
+    int[] prevViewport = new int[4];
+    float[] prevClear = new float[4];
+    boolean[] prevMask = new boolean[4];
+    boolean scissor = GLES20.glIsEnabled(GLES20.GL_SCISSOR_TEST);
+    GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, prevFbo, 0);
+    GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, prevViewport, 0);
+    GLES20.glGetFloatv(GLES20.GL_COLOR_CLEAR_VALUE, prevClear, 0);
+    GLES20.glGetBooleanv(GLES20.GL_COLOR_WRITEMASK, prevMask, 0);
+    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, framebuffer);
+    GLES20.glFramebufferTexture2D(
+        GLES20.GL_FRAMEBUFFER,
+        GLES20.GL_COLOR_ATTACHMENT0,
+        GLES20.GL_TEXTURE_2D,
+        texture,
+        0);
+    GLES20.glViewport(0, 0, width, height);
+    if (scissor) {
+      GLES20.glDisable(GLES20.GL_SCISSOR_TEST);
+    }
+    GLES20.glColorMask(true, true, true, true);
+    GLES20.glClearColor(0f, 0f, 0f, 0f);
+    GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+    if (scissor) {
+      GLES20.glEnable(GLES20.GL_SCISSOR_TEST);
+    }
+    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, prevFbo[0]);
+    GLES20.glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    GLES20.glClearColor(prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
+    GLES20.glColorMask(prevMask[0], prevMask[1], prevMask[2], prevMask[3]);
   }
 
   /**
@@ -2046,6 +2191,7 @@ final class WindParticleLayer {
   }
 
   private void deleteGlObjects() {
+    uniformLocationsReady = false;
     if (quadProgram != 0) {
       GLES20.glDeleteProgram(quadProgram);
       quadProgram = 0;
@@ -2100,25 +2246,52 @@ final class WindParticleLayer {
     trailsDirty = true;
   }
 
-  private void bindQuad(int program) {
+  private void bindQuad(int attrib) {
     GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, quadBuffer);
-    int pos = GLES20.glGetAttribLocation(program, "a_pos");
-    GLES20.glEnableVertexAttribArray(pos);
-    GLES20.glVertexAttribPointer(pos, 2, GLES20.GL_FLOAT, false, 0, 0);
+    GLES20.glEnableVertexAttribArray(attrib);
+    GLES20.glVertexAttribPointer(attrib, 2, GLES20.GL_FLOAT, false, 0, 0);
   }
 
-  private static void bindTexture(int unit, int texture, int program, String name, int index) {
+  private static void bindTexture(int unit, int texture, int location, int index) {
     GLES20.glActiveTexture(unit);
     GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture);
-    GLES20.glUniform1i(GLES20.glGetUniformLocation(program, name), index);
+    GLES20.glUniform1i(location, index);
   }
 
-  private static void uniform1f(int program, String name, float value) {
-    GLES20.glUniform1f(GLES20.glGetUniformLocation(program, name), value);
-  }
-
-  private static void uniform2f(int program, String name, float a, float b) {
-    GLES20.glUniform2f(GLES20.glGetUniformLocation(program, name), a, b);
+  /** Names are resolved once per program link. Looking them up per frame is a string search on the GL thread. */
+  private void ensureUniformLocations() {
+    if (uniformLocationsReady) {
+      return;
+    }
+    aPosQuad = GLES20.glGetAttribLocation(quadProgram, "a_pos");
+    aPosUpdate = GLES20.glGetAttribLocation(updateProgram, "a_pos");
+    aPosProject = GLES20.glGetAttribLocation(projectProgram, "a_pos");
+    aVertDraw = GLES20.glGetAttribLocation(drawProgram, "a_vert");
+    uField = GLES20.glGetUniformLocation(projectProgram, "u_field");
+    uWindMin = GLES20.glGetUniformLocation(projectProgram, "u_wind_min");
+    uWindMax = GLES20.glGetUniformLocation(projectProgram, "u_wind_max");
+    uCurve = GLES20.glGetUniformLocation(projectProgram, "u_curve");
+    uWorld = GLES20.glGetUniformLocation(projectProgram, "u_world");
+    uCenter = GLES20.glGetUniformLocation(projectProgram, "u_center");
+    uHalf = GLES20.glGetUniformLocation(projectProgram, "u_half");
+    uRot = GLES20.glGetUniformLocation(projectProgram, "u_rot");
+    uLon0 = GLES20.glGetUniformLocation(projectProgram, "u_lon0");
+    uLat = GLES20.glGetUniformLocation(projectProgram, "u_lat");
+    uWind = GLES20.glGetUniformLocation(updateProgram, "u_wind");
+    uParticles = GLES20.glGetUniformLocation(updateProgram, "u_particles");
+    uDisp = GLES20.glGetUniformLocation(updateProgram, "u_disp");
+    uScreen = GLES20.glGetUniformLocation(quadProgram, "u_screen");
+    uOpacity = GLES20.glGetUniformLocation(quadProgram, "u_opacity");
+    uLift = GLES20.glGetUniformLocation(quadProgram, "u_lift");
+    uShift = GLES20.glGetUniformLocation(quadProgram, "u_shift");
+    uState0 = GLES20.glGetUniformLocation(drawProgram, "u_state0");
+    uState1 = GLES20.glGetUniformLocation(drawProgram, "u_state1");
+    uLen = GLES20.glGetUniformLocation(drawProgram, "u_len");
+    uLine = GLES20.glGetUniformLocation(drawProgram, "u_line");
+    uEdge = GLES20.glGetUniformLocation(drawProgram, "u_edge");
+    uBlock = GLES20.glGetUniformLocation(drawProgram, "u_block");
+    uColour = GLES20.glGetUniformLocation(drawProgram, "u_colour");
+    uniformLocationsReady = true;
   }
 
   private static int createTexture(int filter) {
@@ -2228,22 +2401,20 @@ final class WindParticleLayer {
     private boolean depth;
     private boolean stencil;
 
-    static GlState capture() {
-      GlState s = new GlState();
-      GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, s.framebuffer, 0);
-      GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, s.viewport, 0);
-      GLES20.glGetIntegerv(GLES20.GL_ARRAY_BUFFER_BINDING, s.arrayBuffer, 0);
-      GLES20.glGetIntegerv(GLES20.GL_CURRENT_PROGRAM, s.program, 0);
-      GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, s.activeTexture, 0);
-      GLES20.glGetIntegerv(GLES20.GL_BLEND_SRC_RGB, s.blendSrcRgb, 0);
-      GLES20.glGetIntegerv(GLES20.GL_BLEND_DST_RGB, s.blendDstRgb, 0);
-      GLES20.glGetIntegerv(GLES20.GL_BLEND_SRC_ALPHA, s.blendSrcAlpha, 0);
-      GLES20.glGetIntegerv(GLES20.GL_BLEND_DST_ALPHA, s.blendDstAlpha, 0);
-      GLES20.glGetBooleanv(GLES20.GL_COLOR_WRITEMASK, s.colorMask, 0);
-      s.blend = GLES20.glIsEnabled(GLES20.GL_BLEND);
-      s.depth = GLES20.glIsEnabled(GLES20.GL_DEPTH_TEST);
-      s.stencil = GLES20.glIsEnabled(GLES20.GL_STENCIL_TEST);
-      return s;
+    void capture() {
+      GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, framebuffer, 0);
+      GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, viewport, 0);
+      GLES20.glGetIntegerv(GLES20.GL_ARRAY_BUFFER_BINDING, arrayBuffer, 0);
+      GLES20.glGetIntegerv(GLES20.GL_CURRENT_PROGRAM, program, 0);
+      GLES20.glGetIntegerv(GLES20.GL_ACTIVE_TEXTURE, activeTexture, 0);
+      GLES20.glGetIntegerv(GLES20.GL_BLEND_SRC_RGB, blendSrcRgb, 0);
+      GLES20.glGetIntegerv(GLES20.GL_BLEND_DST_RGB, blendDstRgb, 0);
+      GLES20.glGetIntegerv(GLES20.GL_BLEND_SRC_ALPHA, blendSrcAlpha, 0);
+      GLES20.glGetIntegerv(GLES20.GL_BLEND_DST_ALPHA, blendDstAlpha, 0);
+      GLES20.glGetBooleanv(GLES20.GL_COLOR_WRITEMASK, colorMask, 0);
+      blend = GLES20.glIsEnabled(GLES20.GL_BLEND);
+      depth = GLES20.glIsEnabled(GLES20.GL_DEPTH_TEST);
+      stencil = GLES20.glIsEnabled(GLES20.GL_STENCIL_TEST);
     }
 
     void restore() {

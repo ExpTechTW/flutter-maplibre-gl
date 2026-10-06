@@ -31,7 +31,11 @@ class MapLibreMethodChannel extends MapLibrePlatform {
   /// HardwareBuffer per frame on 3.47.x. See the app's AndroidManifest.
   static bool useHybridComposition = false;
 
-  Future<dynamic> _handleMethodCall(MethodCall call) async {
+  /// Already completed. Every camera frame used to allocate a fresh future
+  /// because this handler was `async` and never awaited.
+  static final Future<dynamic> _handled = Future<dynamic>.value();
+
+  Future<dynamic> _handleMethodCall(MethodCall call) {
     switch (call.method) {
       case 'infoWindow#onTap':
         final String? symbolId = call.arguments['symbol'];
@@ -149,6 +153,7 @@ class MapLibreMethodChannel extends MapLibrePlatform {
       default:
         throw MissingPluginException();
     }
+    return _handled;
   }
 
   @override

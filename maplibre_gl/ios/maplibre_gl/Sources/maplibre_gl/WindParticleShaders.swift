@@ -244,8 +244,11 @@ enum WindParticleShaders {
     float2 posA = fract(t0.ba + t0.rg / 255.5) * 2.0 - 1.0;
     float2 posB = fract(t1.ba + t1.rg / 255.5) * 2.0 - 1.0;
     float2 dirF = posA - posB;
-    float2 dirFN = normalize(dirF);
+    // One length for both the unit vector and the wrap test. normalize() is
+    // dir/length, so a second length() repeated the same square root on every
+    // corner of every particle.
     float d = length(dirF);
+    float2 dirFN = dirF / max(d, 1e-20);
     float2 dirRN = float2(dirFN.y, -dirFN.x);
     float2 pos = mix(posB, posA, float(a.w) * 0.003921569);
     pos += dirRN * (float2(float(a.z)) * u.lineW.xy + u.lineW.zw);

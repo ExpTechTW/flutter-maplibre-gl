@@ -251,6 +251,18 @@ final class MapLibreMapController
   private Feature draggedFeature;
   private AndroidGesturesManager androidGesturesManager;
 
+  /**
+   * Reused across camera and drag events. The codec copies them into the
+   * message buffer before {@code invokeMethod} returns, so the next event can
+   * overwrite the same maps. Allocating them per frame is what the gesture
+   * GC pauses were.
+   */
+  private final Map<String, Object> cameraMoveArguments = new HashMap<>(4);
+  private final Map<String, Object> cameraIdleArguments = new HashMap<>(4);
+  private final Map<String, Object> cameraPositionJson = new HashMap<>(8);
+  private final List<Double> cameraTargetJson = new ArrayList<>(Arrays.asList(0.0, 0.0));
+  private final Map<String, Object> dragArguments = new HashMap<>(16);
+
   private LatLng dragOrigin;
   private LatLng dragPrevious;
   private MapSnapshotter activeSnapshotter;
@@ -1788,10 +1800,6 @@ final class MapLibreMapController
             // The raw WND1 body, exactly as Dart received it. Dart already has
             // a tested parser and hands over the header it read; parsing again
             // here would be a second copy of the format to keep in step.
-            // The camera goes with it: a field can land before the map has
-            // reported any camera movement, and the renderer draws nothing
-            // until it has one.
-            pushWindCamera(layer);
             layer.setField(
                 new WindParticleLayer.FieldUpload(
                     call.argument("bytes"),
@@ -1815,9 +1823,6 @@ final class MapLibreMapController
           WindParticleLayer layer = windParticleLayer;
           if (layer != null) {
             boolean playing = Boolean.TRUE.equals(call.argument("playing"));
-            if (playing) {
-              pushWindCamera(layer);
-            }
             layer.setPlaying(playing);
           }
           result.success(null);
@@ -3344,53 +3349,41 @@ final class MapLibreMapController
 
   @Override
   public void onCameraMove() {
-    // Before the early return: the wind field has to follow the camera whether
-    // or not Dart asked to be told about it.
-    pushWindCamera(windParticleLayer);
+    // The wind layer reads this frame's camera from the render callback.
+    // Copying it here allocated on the UI thread and could overwrite the
+    // value the render thread had just stored.
     if (!trackCameraPosition) {
       return;
     }
-    final Map<String, Object> arguments = new HashMap<>(2);
-    arguments.put("position", Convert.toJson(mapLibreMap.getCameraPosition()));
-    methodChannel.invokeMethod("camera#onMove", arguments);
+    cameraMoveArguments.put("position", writeCameraPosition(mapLibreMap.getCameraPosition()));
+    methodChannel.invokeMethod("camera#onMove", cameraMoveArguments);
   }
 
   @Override
   public void onCameraIdle() {
-    pushWindCamera(windParticleLayer);
-    final Map<String, Object> arguments = new HashMap<>(2);
+    cameraIdleArguments.clear();
     if (trackCameraPosition) {
-      arguments.put("position", Convert.toJson(mapLibreMap.getCameraPosition()));
+      cameraIdleArguments.put("position", writeCameraPosition(mapLibreMap.getCameraPosition()));
     }
-    methodChannel.invokeMethod("camera#onIdle", arguments);
+    methodChannel.invokeMethod("camera#onIdle", cameraIdleArguments);
   }
 
   /**
-   * Hands the wind layer the camera and viewport for the next frame.
-   *
-   * <p>A snapshot rather than a read from the GL thread: {@code MapLibreMap} is
-   * not thread-safe, and the render thread must never block on the platform
-   * thread — that is the deadlock the whole design avoids. Pushing on move and
-   * on idle covers everything, because a camera that is not moving does not
-   * make the last snapshot stale.
+   * Writes {@code position} into {@link #cameraPositionJson}. Returns null when
+   * there is no camera, matching {@link Convert#toJson(CameraPosition)}.
    */
-  private void pushWindCamera(@Nullable WindParticleLayer layer) {
-    if (layer == null || mapLibreMap == null || mapView == null) {
-      return;
-    }
-    CameraPosition position = mapLibreMap.getCameraPosition();
+  @Nullable
+  private Map<String, Object> writeCameraPosition(CameraPosition position) {
     if (position == null || position.target == null) {
-      return;
+      return null;
     }
-    layer.setCamera(
-        new WindParticleLayer.CameraSnapshot(
-            position.target.getLatitude(),
-            position.target.getLongitude(),
-            position.zoom,
-            position.bearing,
-            mapView.getWidth(),
-            mapView.getHeight(),
-            context.getResources().getDisplayMetrics().density));
+    cameraTargetJson.set(0, position.target.getLatitude());
+    cameraTargetJson.set(1, position.target.getLongitude());
+    cameraPositionJson.put("bearing", position.bearing);
+    cameraPositionJson.put("target", cameraTargetJson);
+    cameraPositionJson.put("tilt", position.tilt);
+    cameraPositionJson.put("zoom", position.zoom);
+    return cameraPositionJson;
   }
 
   @Override
@@ -4176,19 +4169,18 @@ final class MapLibreMapController
   private void invokeFeatureDrag(PointF pointf, String eventType) {
     LatLng current = mapLibreMap.getProjection().fromScreenLocation(pointf);
 
-    final Map<String, Object> arguments = new HashMap<>(9);
-    arguments.put("id", draggedFeature.id());
-    arguments.put("x", pointf.x);
-    arguments.put("y", pointf.y);
-    arguments.put("originLng", dragOrigin.getLongitude());
-    arguments.put("originLat", dragOrigin.getLatitude());
-    arguments.put("currentLng", current.getLongitude());
-    arguments.put("currentLat", current.getLatitude());
-    arguments.put("eventType", eventType);
-    arguments.put("deltaLng", current.getLongitude() - dragPrevious.getLongitude());
-    arguments.put("deltaLat", current.getLatitude() - dragPrevious.getLatitude());
+    dragArguments.put("id", draggedFeature.id());
+    dragArguments.put("x", pointf.x);
+    dragArguments.put("y", pointf.y);
+    dragArguments.put("originLng", dragOrigin.getLongitude());
+    dragArguments.put("originLat", dragOrigin.getLatitude());
+    dragArguments.put("currentLng", current.getLongitude());
+    dragArguments.put("currentLat", current.getLatitude());
+    dragArguments.put("eventType", eventType);
+    dragArguments.put("deltaLng", current.getLongitude() - dragPrevious.getLongitude());
+    dragArguments.put("deltaLat", current.getLatitude() - dragPrevious.getLatitude());
     dragPrevious = current;
-    methodChannel.invokeMethod("feature#onDrag", arguments);
+    methodChannel.invokeMethod("feature#onDrag", dragArguments);
   }
 
   boolean onMove(MoveGestureDetector detector) {

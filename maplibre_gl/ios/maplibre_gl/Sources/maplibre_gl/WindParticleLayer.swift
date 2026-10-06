@@ -274,6 +274,29 @@ class WindParticleLayer: MLNCustomStyleLayer {
   private var trailFront = 0
   private var trailSize = CGSize.zero
 
+  /// Kept for the life of the layer. Building a pass descriptor per frame is
+  /// an allocation on the render thread.
+  private let projectPass = MTLRenderPassDescriptor()
+  private let statePass = MTLRenderPassDescriptor()
+  private let trailPass = MTLRenderPassDescriptor()
+  private let clearPass = MTLRenderPassDescriptor()
+
+  /// Inputs that stay identical while that part of the camera is unchanged.
+  /// A pan keeps zoom and bearing fixed, so `2^zoom` and the bearing trig are
+  /// not repeated. `basisMerc` is the mercator Y of the current centre.
+  private var basisZoom = Double.nan
+  private var basisWorld = 0.0
+  private var basisBearing = Double.nan
+  private var basisCos = 1.0
+  private var basisSin = 0.0
+  private var basisLat = Double.nan
+  private var basisMerc = 0.0
+  private var basisCx = 0.0
+  private var basisCy = 0.0
+  private var trailMerc = 0.0
+  private var amountZoom = Double.nan
+  private var amountDenom = 0.0
+
   // -------------------------------------------------------------------- field
 
   private var windRange = SIMD4<Float>()
@@ -488,10 +511,13 @@ class WindParticleLayer: MLNCustomStyleLayer {
     //     amount(w, h, z) = min(15000, w · h / (50 · 1.6^(z-2)))
     //
     // then halved off desktop, and divided by the 65,536-particle pool.
+    if zoom != amountZoom {
+      amountZoom = zoom
+      amountDenom = 50 * pow(1.6, zoom - 2)
+    }
     let amount = min(
       15000.0,
-      (context.size.width * context.size.height
-        / (50 * pow(1.6, zoom - 2))).rounded())
+      (context.size.width * context.size.height / amountDenom).rounded())
     let relativeAmount =
       amount * 0.5 / Double(Self.stateEdge * Self.stateEdge) * Self.glCountMul
     let perBlock = max(
@@ -527,11 +553,10 @@ class WindParticleLayer: MLNCustomStyleLayer {
     //
     // Once a frame, not once per vertex. After this the particles are in screen
     // space and every remaining pass is the reference's, unmodified.
-    let projPass = MTLRenderPassDescriptor()
-    projPass.colorAttachments[0].texture = projTex
-    projPass.colorAttachments[0].loadAction = .dontCare
-    projPass.colorAttachments[0].storeAction = .store
-    if let enc = buffer.makeRenderCommandEncoder(descriptor: projPass) {
+    projectPass.colorAttachments[0].texture = projTex
+    projectPass.colorAttachments[0].loadAction = .dontCare
+    projectPass.colorAttachments[0].storeAction = .store
+    if let enc = buffer.makeRenderCommandEncoder(descriptor: projectPass) {
       enc.setRenderPipelineState(projectPipeline)
       enc.setFragmentBytes(&u, length: MemoryLayout<WindUniforms>.stride, index: 0)
       enc.setFragmentTexture(windTex, index: 0)
@@ -552,7 +577,6 @@ class WindParticleLayer: MLNCustomStyleLayer {
     u.disp = SIMD4(2 * ox, 2 * oy, -ox, -oy)
 
     // --- advect every particle into the back state texture
-    let statePass = MTLRenderPassDescriptor()
     statePass.colorAttachments[0].texture = stateTex[1 - stateFront]
     statePass.colorAttachments[0].loadAction = .dontCare
     statePass.colorAttachments[0].storeAction = .store
@@ -587,7 +611,6 @@ class WindParticleLayer: MLNCustomStyleLayer {
       trailsDirty = false
     }
 
-    let trailPass = MTLRenderPassDescriptor()
     trailPass.colorAttachments[0].texture = trailTex[1 - trailFront]
     trailPass.colorAttachments[0].storeAction = .store
     if wasDirty {
@@ -663,12 +686,11 @@ class WindParticleLayer: MLNCustomStyleLayer {
   }
 
   private func clearTrail(other index: Int, in buffer: MTLCommandBuffer) {
-    let pass = MTLRenderPassDescriptor()
-    pass.colorAttachments[0].texture = trailTex[index]
-    pass.colorAttachments[0].loadAction = .clear
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
-    pass.colorAttachments[0].storeAction = .store
-    buffer.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+    clearPass.colorAttachments[0].texture = trailTex[index]
+    clearPass.colorAttachments[0].loadAction = .clear
+    clearPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
+    clearPass.colorAttachments[0].storeAction = .store
+    buffer.makeRenderCommandEncoder(descriptor: clearPass)?.endEncoding()
   }
 
   /// The one pass that lands in the map's own encoder.
@@ -688,18 +710,36 @@ class WindParticleLayer: MLNCustomStyleLayer {
 
   // -------------------------------------------------------------------- camera
 
+  private func updateBasis(_ context: MLNStyleLayerDrawingContext) {
+    let zoom = context.zoomLevel
+    let lat = context.centerCoordinate.latitude
+    let bearing = context.direction
+    if zoom != basisZoom {
+      basisZoom = zoom
+      basisWorld = 512 * pow(2.0, zoom)
+    }
+    if bearing != basisBearing {
+      basisBearing = bearing
+      let r = -bearing * Double.pi / 180
+      basisCos = cos(r)
+      basisSin = sin(r)
+    }
+    if lat != basisLat {
+      basisLat = lat
+      basisMerc = Self.mercatorY(lat)
+    }
+    basisCx = (context.centerCoordinate.longitude + 180) / 360 * basisWorld
+    basisCy = basisMerc * basisWorld
+  }
+
   private func uniforms(for context: MLNStyleLayerDrawingContext,
                         mapView: MLNMapView) -> WindUniforms {
     var u = WindUniforms()
-    let zoom = context.zoomLevel
-    let world = 512 * pow(2.0, zoom)
-    let cx = (context.centerCoordinate.longitude + 180) / 360 * world
-    let cy = Self.mercatorY(context.centerCoordinate.latitude) * world
-    let r = -context.direction * Double.pi / 180
+    updateBasis(context)
 
-    u.cam0 = SIMD4(Float(cx), Float(cy),
+    u.cam0 = SIMD4(Float(basisCx), Float(basisCy),
                    Float(context.size.width / 2), Float(context.size.height / 2))
-    u.cam1 = SIMD4(Float(cos(r)), Float(sin(r)), Float(world), fieldLon0)
+    u.cam1 = SIMD4(Float(basisCos), Float(basisSin), Float(basisWorld), fieldLon0)
     u.fld = SIMD4(fieldLat0, fieldLatSpan, 0, 0)
     u.range = SIMD4(windRange.x, windRange.z, windRange.y, windRange.w)
     // (speedMul, speedMin, cPow) = (1/glMaxSpeedParam,
@@ -730,13 +770,12 @@ class WindParticleLayer: MLNCustomStyleLayer {
       } else if abs(lat - trailLat) > 1e-9 || abs(lng - trailLng) > 1e-9 {
         // `projectField` puts a world point at half + (w - centre) rotated by
         // `rot`, so moving the centre by d moves every fixed point on screen by
-        // -d, rotated the same way.
-        let world = 512 * pow(2.0, zoom)
-        let dcx = ((lng - trailLng) / 360) * world
-        let dcy = (Self.mercatorY(lat) - Self.mercatorY(trailLat)) * world
-        let r = -bearing * Double.pi / 180
-        let dx = -dcx * cos(r) + dcy * sin(r)
-        let dy = -dcx * sin(r) - dcy * cos(r)
+        // -d, rotated the same way. Zoom, bearing and mercator Y are the values
+        // `updateBasis` stored for this frame.
+        let dcx = ((lng - trailLng) / 360) * basisWorld
+        let dcy = (basisMerc - trailMerc) * basisWorld
+        let dx = -dcx * basisCos + dcy * basisSin
+        let dy = -dcx * basisSin - dcy * basisCos
         // The fade pass samples at `1 - tex`, where u maps to screen x and v to
         // screen y with y pointing up. Content that moved by (dx, dy) is read
         // back from (-dx, +dy).
@@ -756,6 +795,7 @@ class WindParticleLayer: MLNCustomStyleLayer {
     trailLat = lat
     trailLng = lng
     trailBearing = bearing
+    trailMerc = basisMerc
   }
 
   private static func mercatorY(_ lat: Double) -> Double {

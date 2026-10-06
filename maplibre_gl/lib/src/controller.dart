@@ -269,6 +269,7 @@ class MapLibreMapController extends ChangeNotifier {
     });
 
     _maplibrePlatform.onMapMouseMovePlatform.add((payload) {
+      if (onMapMouseMove.isEmpty) return;
       for (final fun in List.of(onMapMouseMove)) {
         fun(payload["point"], payload["latLng"]);
       }
