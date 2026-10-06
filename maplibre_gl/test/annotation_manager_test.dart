@@ -111,9 +111,7 @@ void main() {
   group('LineManager', () {
     test('add creates a line', () async {
       final line = await controller.addLine(
-        const LineOptions(
-          geometry: [LatLng(0, 0), LatLng(1, 1)],
-        ),
+        const LineOptions(geometry: [LatLng(0, 0), LatLng(1, 1)]),
       );
 
       expect(line, isA<Line>());
@@ -316,6 +314,42 @@ void main() {
         throwsA(isA<Exception>()),
       );
     });
+
+    test(
+      'empty annotationOrder creates no managers and throws on add',
+      () async {
+        // Regression guard for #910: with an empty annotationOrder the style
+        // loads normally but no annotation manager is created, so every add
+        // call must fail with a message pointing at annotationOrder.
+        final freshPlatform = FakeMapLibrePlatform();
+        final freshController = MapLibreMapController(
+          maplibrePlatform: freshPlatform,
+          initialCameraPosition: const CameraPosition(target: LatLng(0, 0)),
+          annotationOrder: const [],
+          annotationConsumeTapEvents: AnnotationType.values,
+        );
+
+        freshPlatform.onMapStyleLoadedPlatform.call(null);
+        await pumpEventQueue();
+
+        expect(freshController.symbolManager, isNull);
+        expect(
+          () => freshController.addSymbol(
+            const SymbolOptions(geometry: LatLng(0, 0)),
+          ),
+          throwsA(
+            isA<Exception>().having(
+              (e) => e.toString(),
+              'message',
+              allOf(
+                contains('AnnotationType.symbol'),
+                contains('annotationOrder'),
+              ),
+            ),
+          ),
+        );
+      },
+    );
   });
 
   group('AnnotationManager drag callback lifecycle', () {
@@ -384,11 +418,17 @@ void main() {
         );
 
         final dragged = <String>[];
-        controller.onFeatureDrag.add(
-          (point, origin, current, delta, id, annotation, eventType) {
-            dragged.add(id);
-          },
-        );
+        controller.onFeatureDrag.add((
+          point,
+          origin,
+          current,
+          delta,
+          id,
+          annotation,
+          eventType,
+        ) {
+          dragged.add(id);
+        });
 
         platform.onFeatureDraggedPlatform.call({
           'id': newSymbol.id,
@@ -412,9 +452,7 @@ void main() {
   group('AnnotationManager GeoJSON output', () {
     test('setGeoJsonSource is called with FeatureCollection on add', () async {
       platform.reset();
-      await controller.addCircle(
-        const CircleOptions(geometry: LatLng(10, 20)),
-      );
+      await controller.addCircle(const CircleOptions(geometry: LatLng(10, 20)));
 
       final calls = platform.callsFor('setGeoJsonSource');
       expect(calls, isNotEmpty);
@@ -426,9 +464,7 @@ void main() {
 
     test('features contain correct id and geometry', () async {
       platform.reset();
-      await controller.addCircle(
-        const CircleOptions(geometry: LatLng(10, 20)),
-      );
+      await controller.addCircle(const CircleOptions(geometry: LatLng(10, 20)));
 
       final calls = platform.callsFor('setGeoJsonSource');
       final features =
@@ -443,9 +479,7 @@ void main() {
     });
 
     test('clear produces empty FeatureCollection', () async {
-      await controller.addCircle(
-        const CircleOptions(geometry: LatLng(10, 20)),
-      );
+      await controller.addCircle(const CircleOptions(geometry: LatLng(10, 20)));
       platform.reset();
       await controller.clearCircles();
 

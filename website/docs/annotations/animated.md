@@ -9,6 +9,12 @@ Smoothly animate annotation position changes using Flutter's animation system.
   loading="lazy"
 ></iframe>
 
+A symbol, a circle and a line over Sydney that move, pulse between blue and red, and change size and opacity as you drive each animation from the buttons.
+
+!!! note "Prerequisites"
+    Annotations only work once the style has loaded and if their type is part of
+    the widget's `annotationOrder`. See [Prerequisites](index.md#prerequisites).
+
 ## How it works
 
 Annotation positions are updated via `updateSymbol()`. By driving updates from a Flutter `AnimationController`, you get smooth motion at the Flutter tick rate (typically 60fps).

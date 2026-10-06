@@ -28,8 +28,22 @@ final class MapLibreHeadersProtocol: URLProtocol {
     /// timeline scrub generate traffic for tiles it had just drawn.
     private static let tileCacheControl = "public, max-age=604800, immutable"
 
-    /// Shared forwarder — never invalidate; cancel tasks only.
-    private static let forwardSession: URLSession = {
+    /// Shared forwarder. Rebuilt only when `setMaxConnectionsPerHost` changes
+    /// the limit; otherwise in-flight work is cancelled in place, never by
+    /// tearing the session down per request.
+    private static let sessionLock = NSLock()
+    private static var forwardSessionStorage: URLSession?
+    /// Fork default: a scrub wants more than URLSession's 6-per-host cap.
+    /// `setOfflineMaxConcurrentRequests` can still raise or lower it.
+    private static let defaultMaxConnectionsPerHost = 16
+    private static var configuredMaxConnectionsPerHost: Int?
+
+    private static var forwardSession: URLSession {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        if let session = forwardSessionStorage {
+            return session
+        }
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = []
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -37,9 +51,26 @@ final class MapLibreHeadersProtocol: URLProtocol {
         // Scrub storms: fail fast instead of holding 30 s slots for abandoned frames.
         config.timeoutIntervalForRequest = 8
         config.timeoutIntervalForResource = 12
-        config.httpMaximumConnectionsPerHost = 16
-        return URLSession(configuration: config)
-    }()
+        config.httpMaximumConnectionsPerHost =
+            configuredMaxConnectionsPerHost ?? defaultMaxConnectionsPerHost
+        let session = URLSession(configuration: config)
+        forwardSessionStorage = session
+        return session
+    }
+
+    /// Relays `setOfflineMaxConcurrentRequests`. Once this protocol owns the
+    /// connection, MapLibre's session limit no longer applies, so the public
+    /// API has to land here. A URLSession copies its configuration at
+    /// construction, so the session is dropped and rebuilt; requests already
+    /// in flight finish on the old one.
+    static func setMaxConnectionsPerHost(_ value: Int) {
+        sessionLock.lock()
+        configuredMaxConnectionsPerHost = value
+        let previous = forwardSessionStorage
+        forwardSessionStorage = nil
+        sessionLock.unlock()
+        previous?.finishTasksAndInvalidate()
+    }
 
     /// Cancels in-flight forwards whose URL contains one of [needles]; an empty
     /// list cancels everything.

@@ -148,6 +148,16 @@ void main() {
       expect(LatLngBounds.fromList(null), isNull);
     });
 
+    test('fromList accepts ints for whole-degree coordinates', () {
+      // JSON has no way to tell 60.0 apart from 60. See issue #241.
+      final bounds = LatLngBounds.fromList([
+        [60, -4.5],
+        [61, 9],
+      ]);
+      expect(bounds!.southwest, const LatLng(60.0, -4.5));
+      expect(bounds.northeast, const LatLng(61.0, 9.0));
+    });
+
     test('contains returns true for point inside', () {
       final bounds = LatLngBounds(
         southwest: const LatLng(10.0, 20.0),
@@ -329,6 +339,66 @@ void main() {
       expect(heading.y, 2.0);
       expect(heading.z, 3.0);
       expect(heading.timestamp, timestamp);
+    });
+  });
+
+  group('ManualLocationUpdate', () {
+    test('toMap serializes position as [lat, lng]', () {
+      const update = ManualLocationUpdate(target: LatLng(37.42, -122.08));
+      final map = update.toMap();
+      expect(map['position'], [37.42, -122.08]);
+    });
+
+    test('toMap serializes timestamp as epoch milliseconds', () {
+      final timestamp = DateTime.fromMillisecondsSinceEpoch(1700000000000);
+      final update = ManualLocationUpdate(
+        target: const LatLng(0, 0),
+        timestamp: timestamp,
+      );
+      expect(update.toMap()['timestamp'], 1700000000000);
+    });
+
+    test('toMap defaults timestamp to now when omitted', () {
+      final before = DateTime.now().millisecondsSinceEpoch;
+      const update = ManualLocationUpdate(target: LatLng(0, 0));
+      final ts = update.toMap()['timestamp'] as int;
+      final after = DateTime.now().millisecondsSinceEpoch;
+      expect(ts, greaterThanOrEqualTo(before));
+      expect(ts, lessThanOrEqualTo(after));
+    });
+
+    test('toMap includes all optional fields when set', () {
+      final update = ManualLocationUpdate(
+        target: const LatLng(1, 2),
+        horizontalAccuracy: 5,
+        verticalAccuracy: 8,
+        altitude: 100,
+        bearing: 270,
+        speed: 3.5,
+        timestamp: DateTime.fromMillisecondsSinceEpoch(42),
+      );
+      final map = update.toMap();
+      expect(map['position'], [1.0, 2.0]);
+      expect(map['horizontalAccuracy'], 5.0);
+      expect(map['verticalAccuracy'], 8.0);
+      expect(map['altitude'], 100.0);
+      expect(map['bearing'], 270.0);
+      expect(map['speed'], 3.5);
+      expect(map['timestamp'], 42);
+    });
+
+    test('toMap omits null optional fields', () {
+      const update = ManualLocationUpdate(target: LatLng(1, 2), speed: 3.5);
+      final map = update.toMap();
+      // Present:
+      expect(map.containsKey('position'), isTrue);
+      expect(map.containsKey('timestamp'), isTrue);
+      expect(map['speed'], 3.5);
+      // Omitted:
+      expect(map.containsKey('horizontalAccuracy'), isFalse);
+      expect(map.containsKey('verticalAccuracy'), isFalse);
+      expect(map.containsKey('altitude'), isFalse);
+      expect(map.containsKey('bearing'), isFalse);
     });
   });
 }
