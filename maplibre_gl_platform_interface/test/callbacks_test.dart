@@ -58,6 +58,29 @@ void main() {
       expect(callbacks.isNotEmpty, isTrue);
     });
 
+    test('onListenersChanged fires only when the list changes', () {
+      final callbacks = ArgumentCallbacks<int>();
+      var changes = 0;
+      callbacks.onListenersChanged = () => changes++;
+
+      void callback(int _) {}
+      callbacks.add(callback);
+      expect(changes, 1);
+
+      callbacks.remove((_) {});
+      expect(changes, 1);
+
+      callbacks.remove(callback);
+      expect(changes, 2);
+
+      callbacks.clear();
+      expect(changes, 2);
+
+      callbacks.add(callback);
+      callbacks.clear();
+      expect(changes, 4);
+    });
+
     test('clear removes all callbacks', () {
       final callbacks = ArgumentCallbacks<int>();
       callbacks.add((_) {});

@@ -8,12 +8,38 @@ public class MapLibreCustomHeaders {
     )
     private static var _customHeaders: [String: String] = [:]
     private static var _filterPatterns: [String] = []
+    /// Compiled once per `setCustomHeaders`. `String.range(of:options:.regularExpression)`
+    /// recompiles on every request, and every tile goes through here.
+    private static var _compiledFilters: [CompiledFilter] = []
+
+    private struct CompiledFilter {
+        let source: String
+        let regex: NSRegularExpression?
+
+        func matches(_ url: String) -> Bool {
+            if let regex {
+                let length = (url as NSString).length
+                return regex.firstMatch(
+                    in: url,
+                    options: [],
+                    range: NSRange(location: 0, length: length)
+                ) != nil
+            }
+            // Patterns NSRegularExpression rejects (an empty pattern matches
+            // every string here; an invalid one matches nothing).
+            return url.range(of: source, options: .regularExpression) != nil
+        }
+    }
 
     // Sets both headers and filter atomically.
     public static func setCustomHeaders(_ headers: [String: String], filter: [String]) {
+        let compiled = filter.map {
+            CompiledFilter(source: $0, regex: try? NSRegularExpression(pattern: $0))
+        }
         queue.async(flags: .barrier) {
             _customHeaders = headers
             _filterPatterns = filter
+            _compiledFilters = compiled
         }
     }
 
@@ -40,17 +66,14 @@ public class MapLibreCustomHeaders {
 
     // Returns headers and whether they should be applied, in a single lock acquisition.
     public static func headersIfApplicable(to url: String) -> (headers: [String: String], apply: Bool) {
-        queue.sync {
-            let apply: Bool
-            if _filterPatterns.isEmpty {
-                apply = true
-            } else {
-                apply = _filterPatterns.contains {
-                    url.range(of: $0, options: .regularExpression) != nil
-                }
-            }
-            return (_customHeaders, apply)
+        let (headers, filters) = queue.sync { (_customHeaders, _compiledFilters) }
+        if filters.isEmpty {
+            return (headers, true)
         }
+        for filter in filters where filter.matches(url) {
+            return (headers, true)
+        }
+        return (headers, false)
     }
 
     public static func shouldApplyHeaders(to url: String) -> Bool {

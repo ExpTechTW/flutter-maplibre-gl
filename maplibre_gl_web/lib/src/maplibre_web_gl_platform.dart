@@ -23,6 +23,9 @@ class MapLibreMapController extends MapLibrePlatform
 
   final _interactiveFeatureLayerIds = <String>{};
   final _mapSubscriptions = <Subscription>[];
+  Subscription? _mapMouseMoveSubscription;
+  Subscription? _dragMoveSubscription;
+  Subscription? _dragUpSubscription;
 
   bool _trackCameraPosition = false;
   GeolocateControl? _geolocateControl;
@@ -57,6 +60,7 @@ class MapLibreMapController extends MapLibrePlatform
     OnPlatformViewCreatedCallback onPlatformViewCreated,
     Set<Factory<OneSequenceGestureRecognizer>>? gestureRecognizers,
   ) {
+    onMapMouseMovePlatform.onListenersChanged = _syncMapMouseMove;
     _creationParams = creationParams;
     _registerViewFactory(onPlatformViewCreated, hashCode);
     return HtmlElementView(
@@ -67,6 +71,10 @@ class MapLibreMapController extends MapLibrePlatform
   @override
   void dispose() {
     _removeManualPuck();
+    onMapMouseMovePlatform.onListenersChanged = null;
+    _mapMouseMoveSubscription?.unsubscribe();
+    _mapMouseMoveSubscription = null;
+    _detachDragGestures();
     for (final sub in _mapSubscriptions) {
       sub.unsubscribe();
     }
@@ -82,13 +90,12 @@ class MapLibreMapController extends MapLibrePlatform
     ui_web.platformViewRegistry.registerViewFactory(
       'plugins.flutter.io/maplibre_gl_$identifier',
       (int viewId) {
-        _mapElement =
-            (web.document.createElement('div') as web.HTMLDivElement)
-              ..style.position = 'absolute'
-              ..style.top = '0'
-              ..style.bottom = '0'
-              ..style.height = '100%'
-              ..style.width = '100%';
+        _mapElement = (web.document.createElement('div') as web.HTMLDivElement)
+          ..style.position = 'absolute'
+          ..style.top = '0'
+          ..style.bottom = '0'
+          ..style.height = '100%'
+          ..style.width = '100%';
         callback(viewId);
         return _mapElement;
       },
@@ -117,10 +124,9 @@ class MapLibreMapController extends MapLibrePlatform
       _map = MapLibreMap(
         MapOptions(
           container: _mapElement,
-          center:
-              (camera != null)
-                  ? LngLat(camera['target'][1], camera['target'][0])
-                  : null,
+          center: (camera != null)
+              ? LngLat(camera['target'][1], camera['target'][0])
+              : null,
           zoom: camera?['zoom'],
           bearing: camera?['bearing'],
           pitch: camera?['tilt'],
@@ -162,12 +168,7 @@ class MapLibreMapController extends MapLibrePlatform
       _loadFromAssets,
     );
     if (missingStyleImages != null) _mapSubscriptions.add(missingStyleImages);
-    if (_dragEnabled) {
-      _mapSubscriptions.add(_map.on('mouseup', _onMouseUp));
-      _mapSubscriptions.add(_map.on('mousemove', _onMouseMove));
-    }
-    // Always listen to mousemove for general map mouse move events
-    _mapSubscriptions.add(_map.on('mousemove', _onMapMouseMove));
+    _syncMapMouseMove();
 
     _initResizeObserver();
 
@@ -305,7 +306,32 @@ class MapLibreMapController extends MapLibrePlatform
           'eventType': 'start',
         };
         onFeatureDraggedPlatform(payload);
+        _attachDragGestures();
       }
+    }
+  }
+
+  void _attachDragGestures() {
+    if (_dragMoveSubscription != null) return;
+    _dragMoveSubscription = _map.on('mousemove', _onMouseMove);
+    _dragUpSubscription = _map.on('mouseup', _onMouseUp);
+  }
+
+  void _detachDragGestures() {
+    _dragMoveSubscription?.unsubscribe();
+    _dragUpSubscription?.unsubscribe();
+    _dragMoveSubscription = null;
+    _dragUpSubscription = null;
+  }
+
+  void _syncMapMouseMove() {
+    final want = _mapCreated && onMapMouseMovePlatform.isNotEmpty;
+    if (want == (_mapMouseMoveSubscription != null)) return;
+    if (want) {
+      _mapMouseMoveSubscription = _map.on('mousemove', _onMapMouseMove);
+    } else {
+      _mapMouseMoveSubscription?.unsubscribe();
+      _mapMouseMoveSubscription = null;
     }
   }
 
@@ -326,6 +352,7 @@ class MapLibreMapController extends MapLibrePlatform
     _dragPrevious = null;
     _dragOrigin = null;
     _map.getCanvas().style.cursor = '';
+    _detachDragGestures();
   }
 
   _onMouseMove(Event e) {
@@ -345,7 +372,7 @@ class MapLibreMapController extends MapLibrePlatform
   }
 
   _onMapMouseMove(Event e) {
-    // Simple mouse move event - just provides position
+    if (onMapMouseMovePlatform.isEmpty) return;
     onMapMouseMovePlatform({
       'point': Point<double>(e.point.x.toDouble(), e.point.y.toDouble()),
       'latLng': LatLng(e.lngLat.lat.toDouble(), e.lngLat.lng.toDouble()),
@@ -1568,10 +1595,9 @@ class MapLibreMapController extends MapLibrePlatform
       geojsonFeature["geometry"] as Map,
     );
     final propertiesRaw = geojsonFeature["properties"];
-    final properties =
-        propertiesRaw != null
-            ? Map<String, dynamic>.from(propertiesRaw as Map)
-            : null;
+    final properties = propertiesRaw != null
+        ? Map<String, dynamic>.from(propertiesRaw as Map)
+        : null;
 
     return Feature(
       geometry: Geometry(
@@ -1972,8 +1998,10 @@ class MapLibreMapController extends MapLibrePlatform
 
   void _handleLayerMouseMove(Event e, String layerId) {
     // Normalize feature ids to String to avoid type mismatch (ids can be int, String, etc.)
-    final currentHoveredFeatures =
-        e.features.map((f) => f.id?.toString()).whereType<String>().toList();
+    final currentHoveredFeatures = e.features
+        .map((f) => f.id?.toString())
+        .whereType<String>()
+        .toList();
     final lastHoveredFeatures = _hoveredFeatureIdsByLayer[layerId] ?? [];
     final features = <String>{
       ...currentHoveredFeatures,
@@ -1996,12 +2024,14 @@ class MapLibreMapController extends MapLibrePlatform
         eventType = 'leave';
       }
 
-      onFeatureHoverPlatform({
-        'id': feature,
-        'point': Point<double>(e.point.x.toDouble(), e.point.y.toDouble()),
-        'latLng': LatLng(e.lngLat.lat.toDouble(), e.lngLat.lng.toDouble()),
-        'eventType': eventType,
-      });
+      if (onFeatureHoverPlatform.isNotEmpty) {
+        onFeatureHoverPlatform({
+          'id': feature,
+          'point': Point<double>(e.point.x.toDouble(), e.point.y.toDouble()),
+          'latLng': LatLng(e.lngLat.lat.toDouble(), e.lngLat.lng.toDouble()),
+          'eventType': eventType,
+        });
+      }
     }
 
     final isAnyFeatureHovered = _hoveredFeatureIdsByLayer.values.any(

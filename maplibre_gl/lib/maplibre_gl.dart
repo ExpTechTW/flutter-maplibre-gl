@@ -36,13 +36,14 @@
 library;
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:collection/collection.dart';
 
 import 'package:maplibre_gl_platform_interface/maplibre_gl_platform_interface.dart';
 

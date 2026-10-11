@@ -161,6 +161,9 @@ final class MapLibreMapController
         PlatformView {
   private static final String TAG = "MapLibreMapController";
 
+  /** Reused for filter and feature-state encoding. Gson instances are thread-safe. */
+  private static final Gson GSON = new Gson();
+
   /**
    * Duration used for {@code locationComponent#setTrackingCameraOptions} when Dart
    * sends none. Mirrors the SDK's own {@code DEFAULT_TRACKING_TILT_ANIM_DURATION},
@@ -1697,7 +1700,7 @@ final class MapLibreMapController
           if (filter instanceof String) {
             jsonElement = JsonParser.parseString((String) filter);
           } else if (filter != null) {
-            jsonElement = new Gson().toJsonTree(filter);
+            jsonElement = GSON.toJsonTree(filter);
           }
           JsonArray jsonArray = null;
           if (jsonElement != null && jsonElement.isJsonArray()) {
@@ -2096,7 +2099,7 @@ final class MapLibreMapController
           if (source == null) {
             break;
           }
-          final JsonObject stateJson = new Gson().toJsonTree(state).getAsJsonObject();
+          final JsonObject stateJson = GSON.toJsonTree(state).getAsJsonObject();
           final boolean applied =
               source instanceof VectorSource
                   ? ((VectorSource) source).setFeatureState(sourceLayer, featureId, stateJson)
@@ -3181,7 +3184,7 @@ final class MapLibreMapController
           String sourceLayerId = (String) call.argument("sourceLayerId");
 
           List<Object> filter = call.argument("filter");
-          JsonElement jsonElement = filter == null ? null : new Gson().toJsonTree(filter);
+          JsonElement jsonElement = filter == null ? null : GSON.toJsonTree(filter);
           JsonArray jsonArray = null;
           if (jsonElement != null && jsonElement.isJsonArray()) {
             jsonArray = jsonElement.getAsJsonArray();

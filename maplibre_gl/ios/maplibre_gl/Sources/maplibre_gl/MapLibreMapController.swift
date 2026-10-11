@@ -20,6 +20,15 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     private var originDragCoordinate: CLLocationCoordinate2D?
     private var dragFeature: MLNFeature?
 
+    /// Reused for camera and drag events. The codec copies them into the
+    /// message buffer before `invokeMethod` returns, so the next event can
+    /// overwrite the same dictionaries.
+    private let cameraMoveArguments = NSMutableDictionary()
+    private let cameraIdleArguments = NSMutableDictionary()
+    private let cameraPositionArguments = NSMutableDictionary()
+    private let cameraTargetArguments = NSMutableArray(array: [0.0, 0.0])
+    private let featureDragArguments = NSMutableDictionary()
+
     private var initialTilt: CGFloat?
     private var trackCameraPosition = false
     private var myLocationEnabled = false
@@ -2180,59 +2189,65 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
            let previous = previousDragCoordinate,
            let origin = originDragCoordinate
         {
-            channel?.invokeMethod("feature#onDrag", arguments: [
-                "id": id,
-                "x": point.x,
-                "y": point.y,
-                "originLng": origin.longitude,
-                "originLat": origin.latitude,
-                "currentLng": coordinate.longitude,
-                "currentLat": coordinate.latitude,
-                "eventType": eventType,
-                "deltaLng": coordinate.longitude - previous.longitude,
-                "deltaLat": coordinate.latitude - previous.latitude,
-            ])
+            featureDragArguments["id"] = id
+            featureDragArguments["x"] = point.x
+            featureDragArguments["y"] = point.y
+            featureDragArguments["originLng"] = origin.longitude
+            featureDragArguments["originLat"] = origin.latitude
+            featureDragArguments["currentLng"] = coordinate.longitude
+            featureDragArguments["currentLat"] = coordinate.latitude
+            featureDragArguments["eventType"] = eventType
+            featureDragArguments["deltaLng"] = coordinate.longitude - previous.longitude
+            featureDragArguments["deltaLat"] = coordinate.latitude - previous.latitude
+            channel?.invokeMethod("feature#onDrag", arguments: featureDragArguments)
         }
     }
 
     @IBAction func handleMapPan(sender: UIPanGestureRecognizer) {
         let began = sender.state == UIGestureRecognizer.State.began
         let end = sender.state == UIGestureRecognizer.State.ended
+        // A map pan hits this on every move. Projecting is only needed while a
+        // feature is actually being dragged, or on the touch that might start one.
+        if dragFeature == nil && !began {
+            return
+        }
         let point = sender.location(in: mapView)
-        let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
 
-        if dragFeature == nil, began, sender.numberOfTouches == 1 {
+        if dragFeature == nil {
+            if sender.numberOfTouches != 1 { return }
             let result = firstFeatureOnLayers(at: point)
-            if let feature = result.feature,
-            let draggable = feature.attribute(forKey: "draggable") as? Bool,
-            draggable {
-                sender.state = UIGestureRecognizer.State.began
-                dragFeature = feature
-                originDragCoordinate = coordinate
-                previousDragCoordinate = coordinate
-                mapView.allowsScrolling = false
-                let eventType = "start"
-                invokeFeatureDrag(point, coordinate, eventType)
-                for gestureRecognizer in mapView.gestureRecognizers! {
-                    if let _ = gestureRecognizer as? UIPanGestureRecognizer {
-                        gestureRecognizer.addTarget(self, action: #selector(handleMapPan))
-                        break
-                    }
+            guard let feature = result.feature,
+                  let draggable = feature.attribute(forKey: "draggable") as? Bool,
+                  draggable
+            else { return }
+            let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
+            sender.state = UIGestureRecognizer.State.began
+            dragFeature = feature
+            originDragCoordinate = coordinate
+            previousDragCoordinate = coordinate
+            mapView.allowsScrolling = false
+            invokeFeatureDrag(point, coordinate, "start")
+            for gestureRecognizer in mapView.gestureRecognizers! {
+                if let _ = gestureRecognizer as? UIPanGestureRecognizer {
+                    gestureRecognizer.addTarget(self, action: #selector(handleMapPan))
+                    break
                 }
             }
+            return
         }
-        if end, dragFeature != nil {
+
+        if end {
+            let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
             mapView.allowsScrolling = true
-            let eventType = "end"
-            invokeFeatureDrag(point, coordinate, eventType)
+            invokeFeatureDrag(point, coordinate, "end")
             dragFeature = nil
             originDragCoordinate = nil
             previousDragCoordinate = nil
+            return
         }
-
-        if !began, !end, dragFeature != nil {
-            let eventType = "drag"
-            invokeFeatureDrag(point, coordinate, eventType)
+        if !began {
+            let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
+            invokeFeatureDrag(point, coordinate, "drag")
             previousDragCoordinate = coordinate
         }
     }
@@ -2867,21 +2882,38 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     }
 
     func mapViewRegionIsChanging(_ mapView: MLNMapView) {
-        if !trackCameraPosition { return }
-        if let channel = channel {
-            channel.invokeMethod("camera#onMove", arguments: [
-                "position": getCamera()?.toDict(mapView: mapView),
-            ])
-        }
+        guard trackCameraPosition, let channel, let camera = getCamera() else { return }
+        writeCamera(camera, mapView: mapView)
+        cameraMoveArguments["position"] = cameraPositionArguments
+        channel.invokeMethod("camera#onMove", arguments: cameraMoveArguments)
     }
 
     func mapView(_ mapView: MLNMapView, regionDidChangeAnimated animated: Bool) {
-        let arguments = trackCameraPosition ? [
-            "position": getCamera()?.toDict(mapView: mapView)
-        ] : [:]
-        if let channel = channel {
-            channel.invokeMethod("camera#onIdle", arguments: arguments)
+        if trackCameraPosition, let camera = getCamera() {
+            writeCamera(camera, mapView: mapView)
+            cameraIdleArguments["position"] = cameraPositionArguments
+        } else {
+            cameraIdleArguments.removeAllObjects()
         }
+        channel?.invokeMethod("camera#onIdle", arguments: cameraIdleArguments)
+    }
+
+    /// Same zoom rule as `MLNMapCamera.toDict`: altitude-derived zoom, with the
+    /// map view's zoom standing in when that division is non-finite.
+    private func writeCamera(_ camera: MLNMapCamera, mapView: MLNMapView) {
+        let computedZoom = MLNZoomLevelForAltitude(
+            camera.altitude,
+            camera.pitch,
+            camera.centerCoordinate.latitude,
+            mapView.frame.size
+        )
+        let zoom = computedZoom.isFinite ? Double(computedZoom) : mapView.zoomLevel
+        cameraTargetArguments.replaceObject(at: 0, with: camera.centerCoordinate.latitude)
+        cameraTargetArguments.replaceObject(at: 1, with: camera.centerCoordinate.longitude)
+        cameraPositionArguments["bearing"] = camera.heading
+        cameraPositionArguments["target"] = cameraTargetArguments
+        cameraPositionArguments["tilt"] = camera.pitch
+        cameraPositionArguments["zoom"] = zoom
     }
 
     func addSourceGeojson(sourceId: String, geojson: String) -> Result<Void, MethodCallError> {

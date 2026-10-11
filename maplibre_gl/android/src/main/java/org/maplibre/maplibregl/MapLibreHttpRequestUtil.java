@@ -26,6 +26,12 @@ abstract class MapLibreHttpRequestUtil {
 
   private static Map<String, String> currentHeaders;
   private static List<String> currentFilter;
+
+  /** {@link Pattern#matches} compiles on every call; tile loads would redo that. */
+  private static final Object filterCompileLock = new Object();
+
+  private static volatile List<String> compiledFilterSource;
+  private static volatile Pattern[] compiledFilterPatterns = new Pattern[0];
   private static Integer currentMaxRequests;
   private static Integer currentMaxRequestsPerHost;
   private static final int MAX_PUT_BYTES = 2 * 1024 * 1024;
@@ -197,30 +203,52 @@ abstract class MapLibreHttpRequestUtil {
     return chain.proceed(request);
   }
 
+  /** No filter applies the headers to every URL. A pattern must match the whole URL. */
+  private static boolean headersApplyTo(String url) {
+    List<String> filter = currentFilter;
+    if (filter == null || filter.isEmpty()) {
+      return true;
+    }
+    Pattern[] patterns = patternsFor(filter);
+    for (Pattern pattern : patterns) {
+      if (pattern.matcher(url).matches()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static Pattern[] patternsFor(List<String> filter) {
+    if (filter == compiledFilterSource) {
+      return compiledFilterPatterns;
+    }
+    synchronized (filterCompileLock) {
+      if (filter == compiledFilterSource) {
+        return compiledFilterPatterns;
+      }
+      Pattern[] next = new Pattern[filter.size()];
+      for (int i = 0; i < filter.size(); i++) {
+        next[i] = Pattern.compile(filter.get(i));
+      }
+      compiledFilterPatterns = next;
+      compiledFilterSource = filter;
+      return next;
+    }
+  }
+
   private static Response applyHeadersAndPut(Interceptor.Chain chain) throws IOException {
     Request.Builder reqBuilder = chain.request().newBuilder();
     String url = chain.request().url().toString();
 
-    if (currentHeaders != null) {
-      boolean shouldApply = currentFilter == null || currentFilter.isEmpty();
-      if (!shouldApply && currentFilter != null) {
-        for (String pattern : currentFilter) {
-          if (Pattern.matches(pattern, url)) {
-            shouldApply = true;
-            break;
-          }
+    if (currentHeaders != null && headersApplyTo(url)) {
+      for (Map.Entry<String, String> header : currentHeaders.entrySet()) {
+        if (header.getKey() == null || header.getKey().trim().isEmpty()) {
+          continue;
         }
-      }
-      if (shouldApply) {
-        for (Map.Entry<String, String> header : currentHeaders.entrySet()) {
-          if (header.getKey() == null || header.getKey().trim().isEmpty()) {
-            continue;
-          }
-          if (header.getValue() == null || header.getValue().trim().isEmpty()) {
-            reqBuilder.removeHeader(header.getKey());
-          } else {
-            reqBuilder.header(header.getKey(), header.getValue());
-          }
+        if (header.getValue() == null || header.getValue().trim().isEmpty()) {
+          reqBuilder.removeHeader(header.getKey());
+        } else {
+          reqBuilder.header(header.getKey(), header.getValue());
         }
       }
     }

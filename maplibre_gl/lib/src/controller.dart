@@ -4,54 +4,58 @@
 
 part of '../maplibre_gl.dart';
 
-typedef OnMapClickCallback =
-    void Function(Point<double> point, LatLng coordinates);
+typedef OnMapClickCallback = void Function(
+  Point<double> point,
+  LatLng coordinates,
+);
 
 // New generalized feature interaction callback that always provides a raw feature id.
 // If the feature also corresponds to a managed annotation, the annotation parameter
 // is non-null; otherwise it is null (e.g. raw style layer feature not managed by an AnnotationManager).
-typedef OnFeatureInteractionCallback =
-    void Function(
-      Point<double> point,
-      LatLng coordinates,
-      String id,
-      String layerId,
-      Annotation? annotation,
-    );
+typedef OnFeatureInteractionCallback = void Function(
+  Point<double> point,
+  LatLng coordinates,
+  String id,
+  String layerId,
+  Annotation? annotation,
+);
 
-typedef OnFeatureDragCallback =
-    void Function(
-      Point<double> point,
-      LatLng origin,
-      LatLng current,
-      LatLng delta,
-      String id,
-      Annotation? annotation,
-      DragEventType eventType,
-    );
+typedef OnFeatureDragCallback = void Function(
+  Point<double> point,
+  LatLng origin,
+  LatLng current,
+  LatLng delta,
+  String id,
+  Annotation? annotation,
+  DragEventType eventType,
+);
 
-typedef OnFeatureHoverCallback =
-    void Function(
-      Point<double> point,
-      LatLng coordinates,
-      String id,
-      Annotation? annotation,
-      HoverEventType eventType,
-    );
+typedef OnFeatureHoverCallback = void Function(
+  Point<double> point,
+  LatLng coordinates,
+  String id,
+  Annotation? annotation,
+  HoverEventType eventType,
+);
 
-typedef OnMapLongClickCallback =
-    void Function(Point<double> point, LatLng coordinates);
+typedef OnMapLongClickCallback = void Function(
+  Point<double> point,
+  LatLng coordinates,
+);
 
-typedef OnMapMouseMoveCallback =
-    void Function(Point<double> point, LatLng coordinates);
+typedef OnMapMouseMoveCallback = void Function(
+  Point<double> point,
+  LatLng coordinates,
+);
 
 typedef OnStyleLoadedCallback = void Function();
 
 typedef OnUserLocationUpdated = void Function(UserLocation location);
 
 typedef OnCameraTrackingDismissedCallback = void Function();
-typedef OnCameraTrackingChangedCallback =
-    void Function(MyLocationTrackingMode mode);
+typedef OnCameraTrackingChangedCallback = void Function(
+  MyLocationTrackingMode mode,
+);
 
 typedef OnCameraMoveCallback = void Function(CameraPosition cameraPosition);
 
@@ -113,6 +117,8 @@ class MapLibreMapController extends ChangeNotifier {
     this.onCameraMove,
   }) : _maplibrePlatform = maplibrePlatform {
     _cameraPosition = initialCameraPosition;
+    _featureHoverListeners.onChanged = _syncFeatureHover;
+    _mapMouseMoveListeners.onChanged = _syncMapMouseMove;
 
     _maplibrePlatform.onFeatureTappedPlatform.add((payload) {
       final id = payload["id"].toString();
@@ -146,9 +152,15 @@ class MapLibreMapController extends ChangeNotifier {
     _maplibrePlatform.onFeatureDraggedPlatform.add((payload) {
       final id = payload["id"];
       final annotation = getAnnotationById(id);
-      final enmDragEventType = DragEventType.values.firstWhere(
-        (element) => element.name == payload["eventType"],
-      );
+      final eventName = payload["eventType"];
+      final enmDragEventType = switch (eventName) {
+        'start' => DragEventType.start,
+        'drag' => DragEventType.drag,
+        'end' => DragEventType.end,
+        _ => DragEventType.values.firstWhere(
+          (element) => element.name == eventName,
+        ),
+      };
       for (final fun in List.of(onFeatureDrag)) {
         fun(
           payload["point"],
@@ -158,23 +170,6 @@ class MapLibreMapController extends ChangeNotifier {
           id,
           annotation,
           enmDragEventType,
-        );
-      }
-    });
-
-    _maplibrePlatform.onFeatureHoverPlatform.add((payload) {
-      final id = payload["id"];
-      final annotation = getAnnotationById(id);
-      final hoverEventType = HoverEventType.values.firstWhere(
-        (e) => e.name == payload["eventType"],
-      );
-      for (final fun in List.of(onFeatureHover)) {
-        fun(
-          payload["point"],
-          payload["latLng"],
-          id,
-          annotation,
-          hoverEventType,
         );
       }
     });
@@ -268,13 +263,6 @@ class MapLibreMapController extends ChangeNotifier {
       onMapLongClick?.call(dict['point'], dict['latLng']);
     });
 
-    _maplibrePlatform.onMapMouseMovePlatform.add((payload) {
-      if (onMapMouseMove.isEmpty) return;
-      for (final fun in List.of(onMapMouseMove)) {
-        fun(payload["point"], payload["latLng"]);
-      }
-    });
-
     _maplibrePlatform.onCameraTrackingChangedPlatform.add((mode) {
       onCameraTrackingChanged?.call(mode);
     });
@@ -338,16 +326,68 @@ class MapLibreMapController extends ChangeNotifier {
   /// Callbacks to receive drag events for features (geojson layer) placed on this map.
   final onFeatureDrag = <OnFeatureDragCallback>[];
 
+  final _HookList<OnFeatureHoverCallback> _featureHoverListeners =
+      _HookList<OnFeatureHoverCallback>();
+
+  final _HookList<OnMapMouseMoveCallback> _mapMouseMoveListeners =
+      _HookList<OnMapMouseMoveCallback>();
+
+  bool _featureHoverAttached = false;
+  bool _mapMouseMoveAttached = false;
+
   /// Callbacks for mouse enter, move and leave over features of a style layer.
   ///
   /// Web only: the list exists on every platform and compiles fine, but Android
   /// and iOS have no pointer to hover with, so nothing is ever added to it there.
   /// Use [onFeatureTapped] for those.
-  final onFeatureHover = <OnFeatureHoverCallback>[];
+  List<OnFeatureHoverCallback> get onFeatureHover => _featureHoverListeners;
 
   /// Callbacks to receive mouse move events over the map.
   /// Provides cursor position (screen point and geographic coordinates).
-  final onMapMouseMove = <OnMapMouseMoveCallback>[];
+  List<OnMapMouseMoveCallback> get onMapMouseMove => _mapMouseMoveListeners;
+
+  void _syncFeatureHover() {
+    final want = _featureHoverListeners.isNotEmpty;
+    if (want == _featureHoverAttached) return;
+    _featureHoverAttached = want;
+    if (want) {
+      _maplibrePlatform.onFeatureHoverPlatform.add(_handleFeatureHover);
+    } else {
+      _maplibrePlatform.onFeatureHoverPlatform.remove(_handleFeatureHover);
+    }
+  }
+
+  void _handleFeatureHover(Map<String, dynamic> payload) {
+    final id = payload["id"];
+    final annotation = getAnnotationById(id);
+    final eventName = payload["eventType"];
+    final hoverEventType = switch (eventName) {
+      'enter' => HoverEventType.enter,
+      'move' => HoverEventType.move,
+      'leave' => HoverEventType.leave,
+      _ => HoverEventType.values.firstWhere((e) => e.name == eventName),
+    };
+    for (final fun in List.of(onFeatureHover)) {
+      fun(payload["point"], payload["latLng"], id, annotation, hoverEventType);
+    }
+  }
+
+  void _syncMapMouseMove() {
+    final want = _mapMouseMoveListeners.isNotEmpty;
+    if (want == _mapMouseMoveAttached) return;
+    _mapMouseMoveAttached = want;
+    if (want) {
+      _maplibrePlatform.onMapMouseMovePlatform.add(_handleMapMouseMove);
+    } else {
+      _maplibrePlatform.onMapMouseMovePlatform.remove(_handleMapMouseMove);
+    }
+  }
+
+  void _handleMapMouseMove(Map<String, dynamic> payload) {
+    for (final fun in List.of(onMapMouseMove)) {
+      fun(payload["point"], payload["latLng"]);
+    }
+  }
 
   /// The current set of symbols on this map added with the [addSymbol] or [addSymbols] methods.
   ///
@@ -2535,5 +2575,50 @@ class MapLibreMapController extends ChangeNotifier {
         "widget (note that an empty annotationOrder disables all annotations).",
       );
     }
+  }
+}
+
+/// A [List] that reports additions and removals. Used so mouse-move and hover
+/// listeners are attached only while the list is non-empty.
+class _HookList<T> extends ListBase<T> {
+  final List<T> _items = <T>[];
+
+  void Function()? onChanged;
+
+  @override
+  int get length => _items.length;
+
+  @override
+  set length(int newLength) {
+    if (newLength == _items.length) return;
+    _items.length = newLength;
+    onChanged?.call();
+  }
+
+  @override
+  T operator [](int index) => _items[index];
+
+  @override
+  void operator []=(int index, T value) {
+    _items[index] = value;
+  }
+
+  @override
+  void add(T element) {
+    _items.add(element);
+    onChanged?.call();
+  }
+
+  @override
+  void insert(int index, T element) {
+    _items.insert(index, element);
+    onChanged?.call();
+  }
+
+  @override
+  T removeAt(int index) {
+    final removed = _items.removeAt(index);
+    onChanged?.call();
+    return removed;
   }
 }

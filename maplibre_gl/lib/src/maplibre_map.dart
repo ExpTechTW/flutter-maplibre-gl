@@ -713,14 +713,6 @@ class MapLibreMapOptions {
 
   final bool? featureTapsTriggersMapClick;
 
-  final _gestureGroup = {
-    'rotateGesturesEnabled',
-    'scrollGesturesEnabled',
-    'tiltGesturesEnabled',
-    'zoomGesturesEnabled',
-    'doubleClickZoomEnabled',
-  };
-
   Map<String, dynamic> toMap() {
     final optionsMap = <String, dynamic>{};
 
@@ -781,29 +773,169 @@ class MapLibreMapOptions {
     return optionsMap;
   }
 
-  Map<String, dynamic> updatesMap(MapLibreMapOptions newOptions) {
-    final prevOptionsMap = toMap();
-    final newOptionsMap = newOptions.toMap();
+  Map<String, dynamic> updatesMap(MapLibreMapOptions next) {
+    final updates = <String, dynamic>{};
 
-    // if any gesture is updated also all other gestures have to the saved to
-    // the update
+    // A null stays omitted, matching [toMap]: clearing a value does not send
+    // an update. Values are the same objects [toMap] would put on the channel.
+    void putIfChanged(String key, Object? previous, Object? value) {
+      if (value == null || previous == value) return;
+      updates[key] = value;
+    }
 
-    final gesturesRequireUpdate = _gestureGroup.any(
-      (key) => newOptionsMap[key] != prevOptionsMap[key],
+    void putColor(String key, Color? previous, Color? value) {
+      if (value == null) return;
+      final encoded = value.toARGB32();
+      if (previous != null && previous.toARGB32() == encoded) return;
+      updates[key] = encoded;
+    }
+
+    void putPoint(String key, Point? previous, Point? value) {
+      if (value == null || previous == value) return;
+      updates[key] = <dynamic>[value.x, value.y];
+    }
+
+    void putEnum<T extends Enum>(String key, T? previous, T? value) {
+      if (value == null || previous == value) return;
+      updates[key] = value.index;
+    }
+
+    putIfChanged('compassEnabled', compassEnabled, next.compassEnabled);
+    if (next.cameraTargetBounds != null &&
+        cameraTargetBounds != next.cameraTargetBounds) {
+      updates['cameraTargetBounds'] = next.cameraTargetBounds!.toJson();
+    }
+    putIfChanged('styleString', styleString, next.styleString);
+    if (next.minMaxZoomPreference != null &&
+        minMaxZoomPreference != next.minMaxZoomPreference) {
+      updates['minMaxZoomPreference'] = next.minMaxZoomPreference!.toJson();
+    }
+
+    // Each flag is applied on its own. Sending an unchanged scroll flag
+    // would turn scrolling back on while a feature drag has disabled it.
+    putIfChanged(
+      'rotateGesturesEnabled',
+      rotateGesturesEnabled,
+      next.rotateGesturesEnabled,
+    );
+    putIfChanged(
+      'scrollGesturesEnabled',
+      scrollGesturesEnabled,
+      next.scrollGesturesEnabled,
+    );
+    putIfChanged(
+      'tiltGesturesEnabled',
+      tiltGesturesEnabled,
+      next.tiltGesturesEnabled,
+    );
+    putIfChanged(
+      'zoomGesturesEnabled',
+      zoomGesturesEnabled,
+      next.zoomGesturesEnabled,
+    );
+    putIfChanged(
+      'doubleClickZoomEnabled',
+      doubleClickZoomEnabled,
+      next.doubleClickZoomEnabled,
     );
 
-    return newOptionsMap..removeWhere((key, value) {
-      if (_gestureGroup.contains(key)) return !gesturesRequireUpdate;
-      final oldValue = prevOptionsMap[key];
-      if (oldValue is List && value is List) {
-        // Use a deep equality check so that nested structures (e.g. the
-        // serialized `cameraTargetBounds`, which becomes a list of lists of
-        // lists) are compared by value. `listEquals` only compares the
-        // top-level elements with `==`, which always reports nested lists
-        // as unequal because Dart's `List` does not override `==`.
-        return const DeepCollectionEquality().equals(oldValue, value);
+    putIfChanged(
+      'trackCameraPosition',
+      trackCameraPosition,
+      next.trackCameraPosition,
+    );
+    putIfChanged(
+      'myLocationEnabled',
+      myLocationEnabled,
+      next.myLocationEnabled,
+    );
+    putEnum(
+      'myLocationTrackingMode',
+      myLocationTrackingMode,
+      next.myLocationTrackingMode,
+    );
+    putEnum(
+      'myLocationRenderMode',
+      myLocationRenderMode,
+      next.myLocationRenderMode,
+    );
+    putIfChanged('logoEnabled', logoEnabled, next.logoEnabled);
+    putEnum('logoViewPosition', logoViewPosition, next.logoViewPosition);
+    putPoint('logoViewMargins', logoViewMargins, next.logoViewMargins);
+    putEnum(
+      'compassViewPosition',
+      compassViewPosition,
+      next.compassViewPosition,
+    );
+    putPoint('compassViewMargins', compassViewMargins, next.compassViewMargins);
+    putEnum(
+      'attributionButtonPosition',
+      attributionButtonPosition,
+      next.attributionButtonPosition,
+    );
+    putPoint(
+      'attributionButtonMargins',
+      attributionButtonMargins,
+      next.attributionButtonMargins,
+    );
+    putColor(
+      'attributionButtonColor',
+      attributionButtonColor,
+      next.attributionButtonColor,
+    );
+    putIfChanged(
+      'scaleControlEnabled',
+      scaleControlEnabled,
+      next.scaleControlEnabled,
+    );
+    putEnum(
+      'scaleControlPosition',
+      scaleControlPosition,
+      next.scaleControlPosition,
+    );
+    putEnum('scaleControlUnit', scaleControlUnit, next.scaleControlUnit);
+    final nextEngine = next.locationEnginePlatforms;
+    if (nextEngine != null && locationEnginePlatforms != nextEngine) {
+      final encoded = nextEngine.toList();
+      final previous = locationEnginePlatforms?.toList();
+      if (previous == null || !_sameInts(previous, encoded)) {
+        updates['locationEngineProperties'] = encoded;
       }
-      return oldValue == value;
-    });
+    }
+    final nextSource = _locationSourceToken(next.locationSource);
+    if (_locationSourceToken(locationSource) != nextSource) {
+      updates['locationSource'] = nextSource;
+    }
+    putColor(
+      'foregroundLoadColor',
+      foregroundLoadColor,
+      next.foregroundLoadColor,
+    );
+    putIfChanged(
+      'translucentTextureSurface',
+      translucentTextureSurface,
+      next.translucentTextureSurface,
+    );
+    putIfChanged(
+      'featureTapsTriggersMapClick',
+      featureTapsTriggersMapClick,
+      next.featureTapsTriggersMapClick,
+    );
+    return updates;
+  }
+
+  static String _locationSourceToken(LocationSource source) {
+    return switch (source) {
+      ManualLocationSource() => 'manual',
+      PlatformLocationSource() => 'platform',
+    };
+  }
+
+  static bool _sameInts(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
   }
 }

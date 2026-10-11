@@ -33,7 +33,6 @@ environment:
   flutter: '>=3.29.0'
 
 dependencies:
-  collection: ^1.19.1
   flutter:
     sdk: flutter
   maplibre_gl_platform_interface: ^0.27.1

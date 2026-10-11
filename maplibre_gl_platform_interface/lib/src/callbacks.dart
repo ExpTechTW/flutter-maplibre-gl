@@ -16,6 +16,13 @@ typedef ArgumentCallback<T> = void Function(T argument);
 class ArgumentCallbacks<T> {
   final List<ArgumentCallback<T>> _callbacks = <ArgumentCallback<T>>[];
 
+  /// Fired after the listener list actually changes.
+  ///
+  /// Platform implementations use this to subscribe to a high-frequency native
+  /// event only while somebody is listening. App code should use [add] and
+  /// [remove].
+  void Function()? onListenersChanged;
+
   /// Callback method. Invokes the corresponding method on each callback
   /// in this collection.
   ///
@@ -36,18 +43,23 @@ class ArgumentCallbacks<T> {
   /// Adds a callback to this collection.
   void add(ArgumentCallback<T> callback) {
     _callbacks.add(callback);
+    onListenersChanged?.call();
   }
 
   /// Removes a callback from this collection.
   ///
   /// Does nothing, if the callback was not present.
   void remove(ArgumentCallback<T> callback) {
-    _callbacks.remove(callback);
+    if (_callbacks.remove(callback)) {
+      onListenersChanged?.call();
+    }
   }
 
   /// Removes all callbacks
   void clear() {
+    if (_callbacks.isEmpty) return;
     _callbacks.clear();
+    onListenersChanged?.call();
   }
 
   /// Whether this collection is empty.
