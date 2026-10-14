@@ -414,10 +414,11 @@ final class WindParticleLayer {
           // pass reads as "hold position" rather than "drift to the pole".
           + "  if (uv.y < 0.0 || uv.y > 1.0) { gl_FragColor = vec4(0.0); return; }\n"
           + "  vec2 v = mix(u_wind_min, u_wind_max, texture2D(u_field, uv).ra);\n"
-          // Into the viewport's frame. The position above was unrotated to find
-          // the grid cell; the vector it holds is still east/north and has to
-          // be turned the same way, or a rotated map keeps north-up arrows.
-          // The v flip is the y-up/y-down change, folded into the rotation.
+          // y-up particle frame, which becomes clip space. Pointing north this
+          // is (+u, +v): east to the right, north toward clip +Y, the top of
+          // the screen. The minus rotates the eastward component; it does not
+          // negate northward v. The map's own Y points down, and this vector
+          // is not flipped a second time.
           + "  v = vec2(v.x * u_rot.x + v.y * u_rot.y,\n"
           + "           -v.x * u_rot.y + v.y * u_rot.x);\n"
           + "  vec2 orient = v * u_curve.x;\n"
@@ -2141,10 +2142,18 @@ final class WindParticleLayer {
   }
 
   /**
-   * Interleaves the two quantised planes into the two channels a
-   * LUMINANCE_ALPHA texture carries, which is what {@code .ra} in the shaders
-   * reads. Done here, once per forecast frame, rather than in Dart: the wire
-   * then carries the untouched WND1 body and the parser stays in one place.
+   * Interleaves the two quantised planes into R and A, which is what {@code
+   * .ra} in the project shader reads: R is eastward u, A is northward v.
+   *
+   * <p>Not {@code GL_LUMINANCE_ALPHA}. The map's context is OpenGL ES 3, which
+   * dropped that format; a driver that rejects it leaves the texture incomplete
+   * and the sample comes back (0, 0, 0, 1). {@code .ra} is then (0, 1), which
+   * dequantises to (uMin, vMax), and the whole field blows as one vector.
+   * RGBA with the second component in A
+   * is the same swizzle the reference packs, and it is legal on both ES
+   * versions. Done here, once per forecast frame, rather than in Dart: the
+   * wire then carries the untouched WND1 body and the parser stays in one
+   * place.
    */
   private void uploadField(FieldUpload upload) {
     int n = upload.width * upload.height;
@@ -2152,10 +2161,10 @@ final class WindParticleLayer {
       Log.e(TAG, "wind field truncated: need " + (upload.planeOffset + n * 2));
       return;
     }
-    byte[] texels = new byte[n * 2];
+    byte[] texels = new byte[n * 4];
     for (int i = 0; i < n; i++) {
-      texels[i * 2] = upload.bytes[upload.planeOffset + i];
-      texels[i * 2 + 1] = upload.bytes[upload.planeOffset + n + i];
+      texels[i * 4] = upload.bytes[upload.planeOffset + i];
+      texels[i * 4 + 3] = upload.bytes[upload.planeOffset + n + i];
     }
     if (windTex == 0) {
       // LINEAR, not NEAREST. The reprojection pass resamples this grid at one
@@ -2174,11 +2183,11 @@ final class WindParticleLayer {
     GLES20.glTexImage2D(
         GLES20.GL_TEXTURE_2D,
         0,
-        GLES20.GL_LUMINANCE_ALPHA,
+        GLES20.GL_RGBA,
         upload.width,
         upload.height,
         0,
-        GLES20.GL_LUMINANCE_ALPHA,
+        GLES20.GL_RGBA,
         GLES20.GL_UNSIGNED_BYTE,
         ByteBuffer.wrap(texels));
     windWidth = upload.width;

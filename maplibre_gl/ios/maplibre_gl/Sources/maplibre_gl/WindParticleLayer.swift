@@ -776,11 +776,11 @@ class WindParticleLayer: MLNCustomStyleLayer {
         let dcy = (basisMerc - trailMerc) * basisWorld
         let dx = -dcx * basisCos + dcy * basisSin
         let dy = -dcx * basisSin - dcy * basisCos
-        // The fade pass samples at `1 - tex`, where u maps to screen x and v to
-        // screen y with y pointing up. Content that moved by (dx, dy) is read
-        // back from (-dx, +dy).
+        // The fade pass samples `(1 - tex.x, tex.y)`. u is screen x; v grows
+        // downward with screen y, the same way `dy` does. Content that moved
+        // by (dx, dy) is read back from (-dx, -dy).
         let shiftX = -dx / Double(u.cam0.z * 2)
-        let shiftY = dy / Double(u.cam0.w * 2)
+        let shiftY = -dy / Double(u.cam0.w * 2)
         if abs(shiftX) > 0.5 || abs(shiftY) > 0.5 {
           // More than half the viewport: almost nothing survives the move, and
           // what does is a thin band of stale streaks along one edge.

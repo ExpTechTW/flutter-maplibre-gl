@@ -74,8 +74,10 @@ enum WindParticleShaders {
   // ------------------------------------------------------------ full-screen quad
 
   vertex QuadOut quadVertex(uint vid [[vertex_id]]) {
-    // The same 0..1 space and the same double flip the GL side uses, so the
-    // fade pass samples the texel it is about to overwrite.
+    // `position = 1 - 2a` puts a=(0,0) at the top-right. The fragment undoes
+    // the x flip only. Metal's texture origin is already the top, so flipping
+    // y as well — which GL must do, because its origin is the bottom — mirrors
+    // the trail.
     float2 corners[4] = {float2(0, 0), float2(1, 0), float2(0, 1), float2(1, 1)};
     float2 a = corners[vid];
     QuadOut out;
@@ -113,9 +115,15 @@ enum WindParticleShaders {
                                       texture2d<float> field [[texture(0)]],
                                       sampler smp [[sampler(0)]]) {
     float2 vp = u.cam0.zw;
-    // Particle space has y up — it becomes clip space directly — and screen
-    // pixels have y down. Identical to the GLSL: `in.tex` is the texel being
-    // written on both platforms, because both run under `updateVertex`.
+    // GLSL writes this under a texture whose v=1 is the top of the view, so
+    // `(1 - v_tex.y)` there is the top of a y-down screen. This pass uses
+    // `updateVertex`, and on Metal the top pixel is tex.y = 0, so the same
+    // expression stores the southern cell in the top texel. The update pass
+    // then samples `pos.y` with no extra flip: a particle at the top of the
+    // screen has pos.y = 1 and reads the bottom texel, which holds the
+    // northern cell. The two inversions cancel. Changing only this line, or
+    // only that sample, pins each particle to the wind from the other side
+    // of the view.
     float2 sp = float2(in.tex.x * 2.0 * vp.x, (1.0 - in.tex.y) * 2.0 * vp.y);
     float2 d = sp - vp;
     // Unrotate, then unproject: the exact inverse of the map's projection.
@@ -127,10 +135,11 @@ enum WindParticleShaders {
     if (uv.y < 0.0 || uv.y > 1.0) { return float4(0.0); }
 
     float2 v = mix(u.range.xy, u.range.zw, field.sample(smp, uv).rg);
-    // Into the viewport's frame. The position above was unrotated to find the
-    // grid cell; the vector it holds is still east/north and has to be turned
-    // the same way, or a rotated map keeps north-up arrows. The v flip is the
-    // y-up/y-down change, folded into the rotation.
+    // Into the y-up particle frame, which is clip space. Pointing north this
+    // is (+u, +v): east to the right, north toward clip +Y, the top of the
+    // screen. The minus rotates the eastward component; it does not negate
+    // northward v. The map's own Y points down, and this vector is not
+    // flipped a second time.
     v = float2(v.x * u.cam1.x + v.y * u.cam1.y,
                -v.x * u.cam1.y + v.y * u.cam1.x);
     float2 orient = v * u.curve.x;
@@ -150,7 +159,14 @@ enum WindParticleShaders {
                                  constant Uniforms &u [[buffer(0)]],
                                  texture2d<float> screen [[texture(0)]],
                                  sampler smp [[sampler(0)]]) {
-    float2 uv = 1.0 - in.tex + u.misc.xy;
+    // GL samples `1 - v_tex` on both axes: its framebuffer origin is the
+    // bottom, so that double flip reads the texel it is about to overwrite.
+    // Here the origin is the top and `position.y = +1` is already that edge.
+    // Flipping y mirrors the accumulated trail on every fade, then the
+    // composite mirrors it again on the way into the map, so a northward
+    // streak is drawn downward and the tail from the previous frame points
+    // the other way. x still has to flip, to cancel `position.x = 1 - 2a`.
+    float2 uv = float2(1.0 - in.tex.x, in.tex.y) + u.misc.xy;
     // Whatever scrolled in from outside the old frame has no history, and
     // sampling it clamped would smear the edge pixel across the strip the pan
     // uncovered.
