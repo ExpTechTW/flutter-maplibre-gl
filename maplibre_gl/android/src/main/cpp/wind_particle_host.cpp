@@ -27,22 +27,32 @@
 // MapLibre calls us; we call nothing of MapLibre's. So this translation unit
 // links against JNI and liblog only — never libmaplibre.so — and the entire
 // contract is the vtable layout of the abstract class below. It is transcribed
-// from `include/mbgl/style/layers/custom_layer.hpp` at tag `android-v13.3.0`,
-// which is the version `build.gradle` pins.
+// from `include/mbgl/style/layers/custom_layer_host.hpp` at tag
+// `android-v13.5.0`, which is the version `build.gradle` pins.
 //
 // **Two things must be re-checked on every MapLibre bump**: the order of the
-// virtual functions, and the fields of `CustomLayerRenderParameters`. Upstream
-// has moved this before — the namespace is `mln::` on newer branches — and a
-// mismatch is not a link error. It is a call through the wrong vtable slot.
+// virtual functions, and the fields of `CustomLayerRenderParameters`. A
+// mismatch is not a link error. It is a call through the wrong vtable slot,
+// and it has happened: 13.5 inserted `preRender` before `render`, and the
+// 13.3 transcription kept building. MapLibre's `preRender` then landed in our
+// `render` with a `gfx::Context` read as the camera (zoom 0, a 0×0 viewport),
+// its `render` landed in our `contextLost` and threw the GL objects away every
+// frame, and its `deinitialize` called past the end of our vtable. On screen:
+// no particles, and nothing in the log but one frame of zeros.
 #include <jni.h>
 
 #include <array>
 #include <cstddef>
 
 namespace mbgl {
+namespace gfx {
+class Context;
+}  // namespace gfx
+
 namespace style {
 
-// Transcribed, not included: the AAR ships no headers.
+// Transcribed, not included: the AAR ships no headers. Only the leading fields
+// are read; 13.5 appends `nearClippedProjectionMatrix` after these.
 struct CustomLayerRenderParameters {
     double width;
     double height;
@@ -55,10 +65,14 @@ struct CustomLayerRenderParameters {
     std::array<double, 16> projectionMatrix;
 };
 
+// Opaque here: passed by reference, never read.
+struct CustomLayerInitParameters;
+
 class CustomLayerHost {
 public:
     virtual ~CustomLayerHost() = default;
-    virtual void initialize() = 0;
+    virtual void initialize(const CustomLayerInitParameters&) = 0;
+    virtual void preRender(const gfx::Context&, const CustomLayerRenderParameters&) {}
     virtual void render(const CustomLayerRenderParameters&) = 0;
     virtual void contextLost() = 0;
     virtual void deinitialize() = 0;
@@ -110,7 +124,9 @@ public:
         peer_ = nullptr;
     }
 
-    void initialize() override { callVoid(onInitialize_); }
+    void initialize(const mbgl::style::CustomLayerInitParameters&) override {
+        callVoid(onInitialize_);
+    }
 
     void render(const mbgl::style::CustomLayerRenderParameters& p) override {
         JNIEnv* env = renderEnv();
