@@ -1873,31 +1873,6 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
             }
             result(nil)
 
-        case "windLayer#setTuning":
-            if let a = methodCall.arguments as? [String: Any], let layer = windParticleLayer {
-              var t = WindTuning()
-              t.zoomLo = a["zoomLo"] as? Double ?? t.zoomLo
-              t.zoomHi = a["zoomHi"] as? Double ?? t.zoomHi
-              t.particlesLo = a["particlesLo"] as? Double ?? t.particlesLo
-              t.particlesHi = a["particlesHi"] as? Double ?? t.particlesHi
-              t.lineWidthZ3 = a["lineWidthZ3"] as? Double ?? t.lineWidthZ3
-              t.lineWidthZ4 = a["lineWidthZ4"] as? Double ?? t.lineWidthZ4
-              t.lineWidthZ5 = a["lineWidthZ5"] as? Double ?? t.lineWidthZ5
-              t.lineWidthZ6 = a["lineWidthZ6"] as? Double ?? t.lineWidthZ6
-              t.lineWidthZ7 = a["lineWidthZ7"] as? Double ?? t.lineWidthZ7
-              t.particleWidth = a["particleWidth"] as? Double ?? t.particleWidth
-              t.speedFactorLo = a["speedFactorLo"] as? Double ?? t.speedFactorLo
-              t.speedFactorHi = a["speedFactorHi"] as? Double ?? t.speedFactorHi
-              t.fadeOpacityLo = a["fadeOpacityLo"] as? Double ?? t.fadeOpacityLo
-              t.fadeOpacityHi = a["fadeOpacityHi"] as? Double ?? t.fadeOpacityHi
-              t.densityCalm = a["densityCalm"] as? Double ?? t.densityCalm
-              t.densityStrong = a["densityStrong"] as? Double ?? t.densityStrong
-              t.speedScale = a["speedScale"] as? Double ?? t.speedScale
-              t.pixelRatio = a["pixelRatio"] as? Double ?? t.pixelRatio
-              layer.setTuning(t)
-            }
-            result(nil)
-
         case "windLayer#setField":
             // The raw WND1 body, exactly as Dart received it. Dart already has a
             // tested parser and hands over the header it read; parsing again

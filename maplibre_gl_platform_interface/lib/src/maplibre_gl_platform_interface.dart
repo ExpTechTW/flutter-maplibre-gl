@@ -165,12 +165,6 @@ abstract class MapLibrePlatform {
   /// Drawn here the particles produce no Flutter frame at all.
   Future<void> addWindParticleLayer() async {}
 
-  /// Sets the zoom-dependent curves as their endpoints.
-  ///
-  /// The whole table, not a per-zoom evaluation: the numbers keep one home on
-  /// the Dart side, and nothing crosses the channel while a finger is moving.
-  Future<void> setWindParticleTuning(Map<String, double> tuning) async {}
-
   /// Uploads a wind field as its raw WND1 body plus the header already parsed
   /// from it, once per forecast frame. Sending the untouched bytes keeps the
   /// format's only parser on the Dart side, where it is tested.

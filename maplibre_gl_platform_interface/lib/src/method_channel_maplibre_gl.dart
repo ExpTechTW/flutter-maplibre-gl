@@ -336,11 +336,6 @@ class MapLibreMethodChannel extends MapLibrePlatform {
   }
 
   @override
-  Future<void> setWindParticleTuning(Map<String, double> tuning) async {
-    await _channel.invokeMethod('windLayer#setTuning', tuning);
-  }
-
-  @override
   Future<void> setWindParticleField(Map<String, Object> field) async {
     await _channel.invokeMethod('windLayer#setField', field);
   }

@@ -1752,8 +1752,8 @@ final class MapLibreMapController
           // own GL surface they cost Flutter no frame at all, which on Android
           // is the difference between working and being killed by lmkd (see
           // WindParticleLayer's class comment).
-          if (windParticleLayer == null && mapView != null) {
-            WindParticleLayer layer = new WindParticleLayer(mapView);
+          if (windParticleLayer == null && mapView != null && mapLibreMap != null) {
+            WindParticleLayer layer = new WindParticleLayer(mapView, mapLibreMap);
             if (layer.attach(style)) {
               windParticleLayer = layer;
             } else {
@@ -1763,35 +1763,6 @@ final class MapLibreMapController
                   null);
               break;
             }
-          }
-          result.success(null);
-          break;
-        }
-      case "windLayer#setTuning":
-        {
-          WindParticleLayer layer = windParticleLayer;
-          if (layer != null) {
-            WindParticleLayer.Tuning t = new WindParticleLayer.Tuning();
-            t.zoomLo = call.argument("zoomLo");
-            t.zoomHi = call.argument("zoomHi");
-            t.particlesLo = call.argument("particlesLo");
-            t.particlesHi = call.argument("particlesHi");
-            t.lineWidthZ3 = call.argument("lineWidthZ3");
-            t.lineWidthZ4 = call.argument("lineWidthZ4");
-            t.lineWidthZ5 = call.argument("lineWidthZ5");
-            t.lineWidthZ6 = call.argument("lineWidthZ6");
-            t.lineWidthZ7 = call.argument("lineWidthZ7");
-            t.particleWidth = call.argument("particleWidth");
-            t.speedFactorLo = call.argument("speedFactorLo");
-            t.speedFactorHi = call.argument("speedFactorHi");
-            t.fadeOpacityLo = call.argument("fadeOpacityLo");
-            t.fadeOpacityHi = call.argument("fadeOpacityHi");
-            t.dropRate = call.argument("dropRate");
-            t.densityCalm = call.argument("densityCalm");
-            t.densityStrong = call.argument("densityStrong");
-            t.speedScale = call.argument("speedScale");
-            t.pixelRatio = call.argument("pixelRatio");
-            layer.setTuning(t);
           }
           result.success(null);
           break;

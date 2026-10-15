@@ -1263,11 +1263,6 @@ class MapLibreMapController extends ChangeNotifier {
   Future<void> addWindParticleLayer() =>
       _maplibrePlatform.addWindParticleLayer();
 
-  /// Sets the zoom-dependent curves as their endpoints — see
-  /// [MapLibrePlatform.setWindParticleTuning].
-  Future<void> setWindParticleTuning(Map<String, double> tuning) =>
-      _maplibrePlatform.setWindParticleTuning(tuning);
-
   /// Uploads one wind field: its raw WND1 body plus the header already parsed
   /// from it. Call once per forecast frame, never per animation frame.
   Future<void> setWindParticleField(Map<String, Object> field) =>
