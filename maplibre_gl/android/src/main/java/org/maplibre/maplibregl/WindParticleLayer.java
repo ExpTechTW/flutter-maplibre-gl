@@ -171,13 +171,27 @@ final class WindParticleLayer {
   private static final double STEP = 1.0 / TARGET_FPS;
   private static final long STEP_NANOS = 1_000_000_000L / TARGET_FPS;
 
-  /** The reference indexes its tables by Leaflet zoom, one above MapLibre's. */
-  private static int windyZoom(double zoom) {
-    return (int) Math.round(zoom + 1);
+  /**
+   * The reference's zoom: Leaflet's, one above MapLibre's.
+   *
+   * <p>Kept fractional. The reference rounds it, but its map snaps to whole
+   * zooms ({@code zoomSnap: 1}), so it only ever draws at the values where
+   * rounding changes nothing. This map rests anywhere, and rounding there makes
+   * the field jump by a factor of 1.6 every time the zoom crosses a half — the
+   * framed-Taiwan view at 4.67 drew the density meant for a whole zoom closer.
+   * Continuous, every table and the count agree with the reference exactly at
+   * whole zooms and move smoothly between them.
+   */
+  private static double windyZoom(double zoom) {
+    return zoom + 1;
   }
 
-  private static double at(double[] table, int index) {
-    return table[Math.max(0, Math.min(table.length - 1, index))];
+  /** {@code table} at a fractional index, linear between entries, clamped at the ends. */
+  private static double at(double[] table, double index) {
+    double i = Math.max(0, Math.min(table.length - 1, index));
+    int lo = (int) Math.floor(i);
+    int hi = Math.min(table.length - 1, lo + 1);
+    return table[lo] + (table[hi] - table[lo]) * (i - lo);
   }
 
   private static float[] buildAlphaLut(float inFrac, float inPow, float outFrac, float outPow) {
@@ -991,7 +1005,7 @@ final class WindParticleLayer {
   private void simulate(double dt) {
     // The reference's parameters, from the reference camera: frozen through a
     // gesture, re-derived when it settles.
-    int z = windyZoom(ref.zoom);
+    double z = windyZoom(ref.zoom);
     double amount =
         Math.min(
             AMOUNT_MAX,

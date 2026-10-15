@@ -145,11 +145,16 @@ class WindParticleLayer: MLNCustomStyleLayer {
     return lut
   }()
 
-  /// The reference indexes its tables by Leaflet zoom, one above MapLibre's.
-  private static func windyZoom(_ zoom: Double) -> Int { Int((zoom + 1).rounded()) }
+  /// The reference's zoom: Leaflet's, one above MapLibre's. Kept fractional —
+  /// see `windyZoom` in the Android twin for why rounding it is wrong here.
+  private static func windyZoom(_ zoom: Double) -> Double { zoom + 1 }
 
-  private static func at(_ table: [Double], _ index: Int) -> Double {
-    table[max(0, min(table.count - 1, index))]
+  /// `table` at a fractional index, linear between entries, clamped at the ends.
+  private static func at(_ table: [Double], _ index: Double) -> Double {
+    let i = max(0, min(Double(table.count - 1), index))
+    let lo = Int(i.rounded(.down))
+    let hi = min(table.count - 1, lo + 1)
+    return table[lo] + (table[hi] - table[lo]) * (i - Double(lo))
   }
 
   // ------------------------------------------------------------------- inputs
@@ -450,7 +455,7 @@ class WindParticleLayer: MLNCustomStyleLayer {
     let z = Self.windyZoom(ref.zoom)
     let amount = min(
       Self.amountMax,
-      (ref.width * ref.height / (50 * pow(1.6, Double(z) - 2))).rounded())
+      (ref.width * ref.height / (50 * pow(1.6, z - 2))).rounded())
     let relativeAmount = amount * Self.countMul / Double(Self.stateEdge * Self.stateEdge)
     let perBlock = max(
       1, min(Self.particlesPerBlock,
