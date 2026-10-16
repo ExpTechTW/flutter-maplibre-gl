@@ -350,6 +350,21 @@ abstract class MapLibrePlatform {
 
   Future<void> setGeoJsonSource(String sourceId, Map<String, dynamic> geojson);
 
+  /// Sets a GeoJSON source's data from [geojson], a FeatureCollection that is
+  /// already encoded as a JSON string.
+  ///
+  /// Android and iOS only ever take a string, so [setGeoJsonSource] has to
+  /// encode its map on the calling isolate, or copy it into a background one
+  /// when it is large. A caller that builds the string somewhere else (a
+  /// long-lived worker isolate, say) hands it over here and skips both.
+  ///
+  /// Deliberately **not abstract**, like [addWindParticleLayer]:
+  /// `maplibre_gl_web` implements this interface too. The default decodes the
+  /// string and hands the map to [setGeoJsonSource], which is what web needs
+  /// anyway, since maplibre-gl-js reads a string passed to `setData` as a URL.
+  Future<void> setGeoJsonSourceEncoded(String sourceId, String geojson) =>
+      setGeoJsonSource(sourceId, jsonDecode(geojson) as Map<String, dynamic>);
+
   Future<void> setCameraBounds({
     required double west,
     required double north,

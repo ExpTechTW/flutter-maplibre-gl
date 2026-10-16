@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
@@ -295,6 +296,121 @@ void main() {
       );
       expect((methodCalls[1].arguments as Map)['geojson'], jsonEncode(small));
     });
+
+    // The encoded path must reach native exactly as the map path does once it
+    // has encoded: same method, same keys, and the string not touched.
+    test('setGeoJsonSourceEncoded sends the string as it is', () async {
+      const encoded = '{"type":"FeatureCollection","features":[]}';
+      await platform.setGeoJsonSourceEncoded('test-source', encoded);
+
+      expect(methodCalls.length, 1);
+      expect(methodCalls[0].method, 'source#setGeoJson');
+      final args = methodCalls[0].arguments as Map;
+      expect(args['sourceId'], 'test-source');
+      expect(args['geojson'], encoded);
+    });
+
+    // An encoded write has nothing to encode, so without the shared queue it
+    // would overtake a map write still being encoded in the background.
+    test('an encoded write waits for a map write queued before it', () async {
+      final big = featureCollection(geometry('LineString', ring(40000)));
+      final small = jsonEncode(
+        featureCollection(geometry('Point', [0.0, 0.0])),
+      );
+
+      final first = platform.setGeoJsonSource('same-source', big);
+      final second = platform.setGeoJsonSourceEncoded('same-source', small);
+      await Future.wait([first, second]);
+
+      expect(methodCalls.length, 2);
+      expect(
+        (methodCalls[0].arguments as Map)['geojson'],
+        jsonEncode(big),
+        reason: 'the map write was queued first and must be sent first',
+      );
+      expect((methodCalls[1].arguments as Map)['geojson'], small);
+    });
+
+    test('a map write waits for an encoded write queued before it', () async {
+      final encoded = jsonEncode(
+        featureCollection(geometry('Point', [1.0, 1.0])),
+      );
+      final big = featureCollection(geometry('LineString', ring(40000)));
+
+      final first = platform.setGeoJsonSourceEncoded('same-source', encoded);
+      final second = platform.setGeoJsonSource('same-source', big);
+      final third = platform.setGeoJsonSourceEncoded('same-source', encoded);
+      await Future.wait([first, second, third]);
+
+      expect(
+        [for (final call in methodCalls) (call.arguments as Map)['geojson']],
+        [encoded, jsonEncode(big), encoded],
+      );
+    });
+
+    // A write the platform has not answered yet holds back the next write to
+    // its source, whichever path either took, and only that source.
+    test('an unanswered write holds back only its own source', () async {
+      final gate = Completer<void>();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('plugins.flutter.io/maplibre_gl_0'),
+            (methodCall) async {
+              methodCalls.add(methodCall);
+              if ((methodCall.arguments as Map)['sourceId'] == 'slow-source' &&
+                  !gate.isCompleted) {
+                await gate.future;
+              }
+              return null;
+            },
+          );
+      const encoded = '{"type":"FeatureCollection","features":[]}';
+      final small = featureCollection(geometry('Point', [0.0, 0.0]));
+
+      final first = platform.setGeoJsonSourceEncoded('slow-source', encoded);
+      final second = platform.setGeoJsonSource('slow-source', small);
+      await platform.setGeoJsonSourceEncoded('fast-source', encoded);
+      await pumpEventQueue();
+      expect(
+        [for (final call in methodCalls) (call.arguments as Map)['sourceId']],
+        ['slow-source', 'fast-source'],
+        reason: 'the second slow-source write waits; fast-source does not',
+      );
+
+      gate.complete();
+      await Future.wait([first, second]);
+      expect(methodCalls.length, 3);
+      expect((methodCalls[2].arguments as Map)['geojson'], jsonEncode(small));
+    });
+
+    test(
+      'a failed encoded write does not block the next write to the source',
+      () async {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('plugins.flutter.io/maplibre_gl_0'),
+              (methodCall) async {
+                methodCalls.add(methodCall);
+                if (methodCalls.length == 1) {
+                  throw PlatformException(code: 'boom');
+                }
+                return null;
+              },
+            );
+
+        const encoded = '{"type":"FeatureCollection","features":[]}';
+        await expectLater(
+          platform.setGeoJsonSourceEncoded('same-source', encoded),
+          throwsA(isA<PlatformException>()),
+        );
+        await platform.setGeoJsonSource(
+          'same-source',
+          featureCollection(geometry('Point', [0.0, 0.0])),
+        );
+
+        expect(methodCalls.length, 2);
+      },
+    );
 
     test(
       'a failed write does not block the next write to the same source',

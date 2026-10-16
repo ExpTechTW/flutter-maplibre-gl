@@ -540,6 +540,24 @@ class MapLibreMapController extends ChangeNotifier {
     await _maplibrePlatform.setGeoJsonSource(sourceId, geojson);
   }
 
+  /// Sets new GeoJSON data, already encoded as a JSON string, on an existing
+  /// source.
+  ///
+  /// The same as [setGeoJsonSource] for a caller that already holds the
+  /// encoded FeatureCollection, typically one that built it on a background
+  /// isolate. On Android and iOS [setGeoJsonSource] encodes its map on the
+  /// calling isolate, or copies the map into a background isolate when it is
+  /// large; this sends [geojson] as it is. Writes to one source still land in
+  /// call order, whichever of the two methods made them.
+  ///
+  /// On web the string is decoded and handed to [setGeoJsonSource].
+  ///
+  /// The returned [Future] completes after the change has been made on the
+  /// platform side.
+  Future<void> setGeoJsonSourceEncoded(String sourceId, String geojson) async {
+    await _maplibrePlatform.setGeoJsonSourceEncoded(sourceId, geojson);
+  }
+
   /// Sets new geojson data to and existing source
   ///
   /// This only works as exected if the source has been created with

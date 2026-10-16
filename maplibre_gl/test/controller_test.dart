@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -156,6 +157,21 @@ void main() {
       expect(calls.length, 1);
       expect(calls.first.positionalArgs[0], 'src-1');
     });
+
+    // The fake does not override the encoded path, so this also pins the
+    // interface's default, which is what web runs: decode, then the map path.
+    test(
+      'setGeoJsonSourceEncoded decodes into setGeoJsonSource by default',
+      () async {
+        final geojson = buildFeatureCollection([]);
+        await controller.setGeoJsonSourceEncoded('src-1', jsonEncode(geojson));
+
+        final calls = platform.callsFor('setGeoJsonSource');
+        expect(calls.length, 1);
+        expect(calls.first.positionalArgs[0], 'src-1');
+        expect(calls.first.positionalArgs[1], geojson);
+      },
+    );
 
     test('addSource delegates to platform', () async {
       const props = VectorSourceProperties(

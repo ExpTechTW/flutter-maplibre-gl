@@ -873,10 +873,22 @@ class MapLibreMethodChannel extends MapLibrePlatform {
   @override
   Future<void> setGeoJsonSource(String sourceId, Map<String, dynamic> geojson) {
     return _writeGeoJson(sourceId, () async {
-      await _channel.invokeMethod('source#setGeoJson', <String, dynamic>{
-        'sourceId': sourceId,
-        'geojson': await _encodeGeoJson(geojson),
-      });
+      await _sendGeoJson(sourceId, await _encodeGeoJson(geojson));
+    });
+  }
+
+  /// The same native call [setGeoJsonSource] makes once it has encoded, in the
+  /// same per-source queue, so an encoded write and a map write to one source
+  /// still reach the platform in call order.
+  @override
+  Future<void> setGeoJsonSourceEncoded(String sourceId, String geojson) {
+    return _writeGeoJson(sourceId, () => _sendGeoJson(sourceId, geojson));
+  }
+
+  Future<void> _sendGeoJson(String sourceId, String geojson) async {
+    await _channel.invokeMethod('source#setGeoJson', <String, dynamic>{
+      'sourceId': sourceId,
+      'geojson': geojson,
     });
   }
 
@@ -894,10 +906,11 @@ class MapLibreMethodChannel extends MapLibrePlatform {
   /// the calling side. Measured on a desktop machine, a 100k-point line blocks
   /// the main isolate for about 46 ms inline against about 30 ms offloaded,
   /// while total duration grows from about 45 ms to about 72 ms. Dropping that
-  /// last 30 ms needs an API taking already encoded GeoJSON, since that copy is
-  /// the cost. A long-lived worker isolate was measured and rejected: the spawn
-  /// is only about 0.1 ms, and a shared worker queues a small write behind a
-  /// large one (58 ms) instead of letting it take the synchronous path.
+  /// last 30 ms needs GeoJSON that is already encoded, since that copy is the
+  /// cost: [setGeoJsonSourceEncoded] takes it. A long-lived worker isolate
+  /// inside this method was measured and rejected: the spawn is only about
+  /// 0.1 ms, and a shared worker queues a small write behind a large one
+  /// (58 ms) instead of letting it take the synchronous path.
   ///
   /// Web never gets here: it hands the decoded map straight to maplibre-gl-js.
   static const _geoJsonOffloadFeatureCount = 100;
