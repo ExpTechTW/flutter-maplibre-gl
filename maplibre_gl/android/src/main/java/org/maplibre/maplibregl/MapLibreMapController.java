@@ -650,6 +650,10 @@ final class MapLibreMapController
       locationComponent.activateLocationComponent(optionsBuilder.build());
       locationComponent.setLocationComponentEnabled(true);
       locationComponent.setMaxAnimationFps(30);
+      if (!(locationComponent.getCompassEngine() instanceof SteadyCompassEngine)) {
+        locationComponent.setCompassEngine(
+            new SteadyCompassEngine(locationComponent.getCompassEngine()));
+      }
       updateMyLocationTrackingMode();
       updateMyLocationRenderMode();
       locationComponent.addOnCameraTrackingChangedListener(this);
@@ -753,16 +757,10 @@ final class MapLibreMapController
         LocationComponentOptions.builder(context);
     optionsBuilder.trackingGesturesManagement(true);
 
-    // Match iOS's built-in user-location view (MLNFaux3DUserLocationAnnotationView),
-    // which bakes in a looping halo pulse over a faint static accuracy ring and
-    // offers no way to turn either off. Android draws neither unless asked, so
-    // without this the same app looks materially different on the two platforms.
-    // Keep in sync with `userLocationTintColor` in MapLibreMapController.swift.
-    optionsBuilder.pulseEnabled(true);
-    optionsBuilder.pulseSingleDuration(LOCATION_PULSE_DURATION_MS);
-    optionsBuilder.pulseMaxRadius(LOCATION_PULSE_MAX_RADIUS_DP);
-    optionsBuilder.pulseColor(LOCATION_TINT_COLOR);
-    optionsBuilder.pulseAlpha(LOCATION_PULSE_ALPHA);
+    // No pulse: its animator redraws the whole map on every step, which keeps a
+    // settled map rendering at the full frame rate. Keep the tint in sync with
+    // `userLocationTintColor` in MapLibreMapController.swift.
+    optionsBuilder.pulseEnabled(false);
     optionsBuilder.accuracyColor(LOCATION_TINT_COLOR);
     optionsBuilder.accuracyAlpha(LOCATION_ACCURACY_ALPHA);
     optionsBuilder.foregroundTintColor(LOCATION_TINT_COLOR);
