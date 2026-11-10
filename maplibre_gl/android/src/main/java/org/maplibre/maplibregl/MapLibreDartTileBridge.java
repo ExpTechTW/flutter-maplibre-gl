@@ -6,6 +6,7 @@ import android.util.Base64;
 import androidx.annotation.Nullable;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodChannel;
+import io.flutter.plugin.common.StandardMethodCodec;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -236,8 +237,15 @@ final class MapLibreDartTileBridge {
   }
 
   static void attach(BinaryMessenger messenger) {
+    // Incoming calls run serially on a background queue owned by this messenger.
+    // Outgoing invokeMethod is posted to the platform thread.
+    BinaryMessenger.TaskQueue taskQueue = messenger.makeBackgroundTaskQueue();
     MethodChannel ch =
-        new MethodChannel(messenger, "plugins.flutter.io/maplibre_gl/tile_cache");
+        new MethodChannel(
+            messenger,
+            "plugins.flutter.io/maplibre_gl/tile_cache",
+            StandardMethodCodec.INSTANCE,
+            taskQueue);
     synchronized (channelLock) {
       attachedChannels.put(messenger, ch);
     }
@@ -378,7 +386,14 @@ final class MapLibreDartTileBridge {
     if (detached != null) detached.setMethodCallHandler(null);
   }
 
-  /** Selects only an engine that has proved its Dart tile handler is alive. */
+  /**
+   * Selects only an engine that has proved its Dart tile handler is alive.
+   *
+   * <p>Called from the channel's background queue and from the platform thread. {@code
+   * attachedChannels}, {@code activeMessenger}, and {@code channel} are read and written only
+   * while holding {@code channelLock}, including from {@link #attach} and {@link #detach}. A
+   * candidate that is no longer mapped is ignored.
+   */
   private static void activate(BinaryMessenger messenger, MethodChannel candidate) {
     synchronized (channelLock) {
       if (attachedChannels.get(messenger) != candidate) return;
