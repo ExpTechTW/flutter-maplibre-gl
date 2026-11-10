@@ -461,6 +461,8 @@ final class WindParticleLayer {
 
   private volatile FieldUpload pendingField;
   private volatile boolean playing;
+  /** Host map is paused, so the frame pump stays stopped until the map resumes. */
+  private boolean hostPaused;
   private volatile boolean restart;
   private volatile boolean released;
 
@@ -742,12 +744,25 @@ final class WindParticleLayer {
       restart = true;
     }
     playing = value;
-    if (value) {
+    if (value && !hostPaused) {
       startPump();
-    } else {
+    } else if (!value) {
       stopPump();
     }
     map.triggerRepaint();
+  }
+
+  /**
+   * Platform thread. A paused host stops the frame pump. Clearing the pause
+   * starts it again only while playback is on.
+   */
+  void setHostPaused(boolean paused) {
+    hostPaused = paused;
+    if (paused) {
+      stopPump();
+    } else if (playing) {
+      startPump();
+    }
   }
 
   /** Platform thread. Uploaded on the next GL frame; the trails carry over, as in the reference. */

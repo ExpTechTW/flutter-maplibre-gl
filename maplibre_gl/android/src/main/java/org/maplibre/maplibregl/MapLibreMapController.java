@@ -249,7 +249,6 @@ final class MapLibreMapController
 
   private MethodChannel.Result mapReadyResult;
   private LocationComponent locationComponent = null;
-  private LocationEngineCallback<LocationEngineResult> locationEngineCallback = null;
   private Style style;
   private Feature draggedFeature;
   private AndroidGesturesManager androidGesturesManager;
@@ -3551,7 +3550,6 @@ final class MapLibreMapController
     if (locationComponent != null) {
       locationComponent.setLocationComponentEnabled(false);
     }
-    stopListeningForLocationUpdates();
 
     // Persist MapView state so it can be restored when a new MapView is created
     // (e.g. across "Don't keep activities" or rotation).
@@ -3623,8 +3621,8 @@ final class MapLibreMapController
     if (disposed || mapView == null || mapViewResumed) {
       return;
     }
-    // Same reasoning as onStart: neither the location updates nor the forced
-    // repaint inside resumeMapView belong to a map nobody is looking at.
+    // Same reasoning as onStart: the forced repaint inside resumeMapView does
+    // not belong to a map nobody is looking at.
     if (pausedByDart) {
       return;
     }
@@ -3651,6 +3649,9 @@ final class MapLibreMapController
 
   /** Stops one map without depending on the Activity lifecycle to arrive afterwards. */
   private void pauseMapView() {
+    if (windParticleLayer != null) {
+      windParticleLayer.setHostPaused(true);
+    }
     if (mapView == null) {
       return;
     }
@@ -3678,8 +3679,8 @@ final class MapLibreMapController
       view.onResume();
       mapViewResumed = true;
     }
-    if (myLocationEnabled) {
-      startListeningForLocationUpdates();
+    if (windParticleLayer != null) {
+      windParticleLayer.setHostPaused(false);
     }
     // Activity onResume used to be the only path that forced this repaint. When
     // pausedByDart made that callback skip an off-screen map, map#resume only
@@ -3991,46 +3992,8 @@ final class MapLibreMapController
       enableLocationComponent(mapLibreMap.getStyle());
     }
 
-    if (myLocationEnabled) {
-      startListeningForLocationUpdates();
-    } else {
-      stopListeningForLocationUpdates();
-    }
-
     if (locationComponent != null) {
       locationComponent.setLocationComponentEnabled(myLocationEnabled);
-    }
-  }
-
-  private void startListeningForLocationUpdates() {
-    if (locationEngineCallback == null
-        && locationComponent != null
-        && locationComponent.isLocationComponentActivated()
-        && locationComponent.getLocationEngine() != null) {
-      locationEngineCallback =
-          new LocationEngineCallback<LocationEngineResult>() {
-            @Override
-            public void onSuccess(LocationEngineResult result) {
-              onUserLocationUpdate(result.getLastLocation());
-            }
-
-            @Override
-            public void onFailure(@NonNull Exception exception) {}
-          };
-      locationComponent
-          .getLocationEngine()
-          .requestLocationUpdates(
-              locationComponent.getLocationEngineRequest(), locationEngineCallback, null);
-    }
-  }
-
-  private void stopListeningForLocationUpdates() {
-    if (locationEngineCallback != null
-        && locationComponent != null
-        && locationComponent.isLocationComponentActivated()
-        && locationComponent.getLocationEngine() != null) {
-      locationComponent.getLocationEngine().removeLocationUpdates(locationEngineCallback);
-      locationEngineCallback = null;
     }
   }
 
